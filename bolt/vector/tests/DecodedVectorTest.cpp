@@ -1453,4 +1453,39 @@ TEST_F(DecodedVectorTest, previousIndicesInReUsedDecodedVector) {
   EXPECT_EQ(rawIndices[0], 0);
 }
 
+TEST_F(DecodedVectorTest, hashAggLayoutModes) {
+  // Layout mode discriminators for HashAgg batch paths.
+  auto flat = makeFlatVector<int64_t>(10, [](auto row) { return row * 3; });
+  DecodedVector decodedFlat(*flat);
+  EXPECT_EQ(0, decodedFlat.hashAggNullsLayoutMode());
+  EXPECT_EQ(1, decodedFlat.hashAggIndicesLayoutMode());
+
+  auto constVec = makeConstant<int64_t>(42, 7);
+  DecodedVector decodedConst(*constVec);
+  EXPECT_EQ(0, decodedConst.hashAggNullsLayoutMode());
+  EXPECT_EQ(2, decodedConst.hashAggIndicesLayoutMode());
+
+  auto indices = makeIndices(5, [](auto row) { return row; });
+  auto dict = BaseVector::wrapInDictionary(nullptr, indices, 5, flat);
+  DecodedVector decodedDict(*dict);
+  EXPECT_EQ(0, decodedDict.hashAggNullsLayoutMode());
+  EXPECT_EQ(3, decodedDict.hashAggIndicesLayoutMode());
+  ASSERT_NE(nullptr, decodedDict.hashAggMutableIndices());
+  ASSERT_NE(nullptr, decodedDict.hashAggMutableRawData());
+
+  auto nullableFlat =
+      makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, 5});
+  DecodedVector decodedNullable(*nullableFlat);
+  EXPECT_EQ(1, decodedNullable.hashAggNullsLayoutMode());
+  EXPECT_EQ(1, decodedNullable.hashAggIndicesLayoutMode());
+  ASSERT_NE(nullptr, decodedNullable.hashAggMutableCombinedNullBits());
+
+  SelectivityVector rows(8, false);
+  rows.setValid(2, true);
+  rows.setValid(5, true);
+  rows.updateBounds();
+  EXPECT_NE(nullptr, rows.allBits());
+  EXPECT_LE(rows.begin(), rows.end());
+}
+
 } // namespace bytedance::bolt::test

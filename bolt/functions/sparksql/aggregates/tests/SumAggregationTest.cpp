@@ -33,6 +33,8 @@
 #include "bolt/functions/lib/aggregates/tests/SumTestBase.h"
 #include "bolt/functions/sparksql/aggregates/Register.h"
 
+#include <cstdlib>
+
 using bytedance::bolt::exec::test::PlanBuilder;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::functions::aggregate::test;
@@ -125,6 +127,190 @@ class SumAggregationTest : public SumTestBase {
 
 TEST_F(SumAggregationTest, overflow) {
   SumTestBase::testAggregateOverflow<int64_t, int64_t, int64_t>("spark_sum");
+}
+
+// DuckDB parity: same SQL/input as reference. Spark sum(bigint) defaults to SubOp;
+// `BOLT_SPARK_SUM_INT64_USE_SUBOP=0` selects Base (see env test below).
+TEST_F(SumAggregationTest, sumInt64SubOpParity) {
+  auto globalInput =
+      makeRowVector({makeFlatVector<int64_t>({7, 11, 13, -5, 2})});
+  createDuckDbTable({globalInput});
+  testAggregations(
+      {globalInput},
+      {},
+      {"spark_sum(c0)"},
+      "SELECT sum(c0) FROM tmp",
+      /*config*/ {},
+      /*testWithTableScan*/ false);
+
+  auto groupedInput = makeRowVector(
+      {makeFlatVector<int32_t>({0, 0, 1, 1, 1}),
+       makeFlatVector<int64_t>({100, 200, 30, 40, 50})});
+  createDuckDbTable({groupedInput});
+  testAggregations(
+      {groupedInput},
+      {"c0"},
+      {"spark_sum(c1)"},
+      "SELECT c0, sum(c1) FROM tmp GROUP BY c0",
+      {},
+      false);
+}
+
+// Same parity as above with SubOp disabled at process start (POSIX setenv).
+// Gluten: `spark.executorEnv.BOLT_SPARK_SUM_INT64_USE_SUBOP=0` on executors.
+TEST_F(SumAggregationTest, sumInt64SubOpEnvOffParity) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
+#else
+  constexpr const char* kEnv = "BOLT_SPARK_SUM_INT64_USE_SUBOP";
+  ASSERT_EQ(0, ::setenv(kEnv, "0", 1));
+  struct UnsetEnv {
+    const char* key;
+    ~UnsetEnv() {
+      ::unsetenv(key);
+    }
+  } unset{kEnv};
+
+  auto globalInput =
+      makeRowVector({makeFlatVector<int64_t>({7, 11, 13, -5, 2})});
+  createDuckDbTable({globalInput});
+  testAggregations(
+      {globalInput},
+      {},
+      {"spark_sum(c0)"},
+      "SELECT sum(c0) FROM tmp",
+      /*config*/ {},
+      /*testWithTableScan*/ false);
+
+  auto groupedInput = makeRowVector(
+      {makeFlatVector<int32_t>({0, 0, 1, 1, 1}),
+       makeFlatVector<int64_t>({100, 200, 30, 40, 50})});
+  createDuckDbTable({groupedInput});
+  testAggregations(
+      {groupedInput},
+      {"c0"},
+      {"spark_sum(c1)"},
+      "SELECT c0, sum(c1) FROM tmp GROUP BY c0",
+      {},
+      false);
+#endif
+}
+
+// Nullable grouped bigint: `decoded.mayHaveNulls()` is true; with table-side null
+// groups (`numNulls_`) and Spark overflow gate this hits the SubOp SVE path on
+// **Linux AArch64 + SVE auxv**; on other hosts SubOp falls back to `SumAggregateBase`
+// and the DuckDB reference is unchanged.
+TEST_F(SumAggregationTest, sumInt64SubOpNullableSveGate) {
+  auto input = makeRowVector({
+      makeFlatVector<int32_t>({0, 0, 1, 1, 1, 2}),
+      makeNullableFlatVector<int64_t>(
+          {10, std::nullopt, 30, 4, std::nullopt, 100}),
+  });
+  createDuckDbTable({input});
+
+  testAggregations(
+      {input},
+      {"c0"},
+      {"spark_sum(c1)"},
+      "SELECT c0, sum(c1) FROM tmp GROUP BY c0",
+      {},
+      false);
+}
+
+// Same nullable grouped input: default SubOp (SVE on Linux aarch64 + auxv) vs
+// `BOLT_SPARK_SUM_INT64_USE_SUBOP=0` (Base). Final partial+final results must
+// match; catches SVE vs scalar divergence without relying on DuckDB alone.
+TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
+#else
+  constexpr const char* kEnv = "BOLT_SPARK_SUM_INT64_USE_SUBOP";
+
+  const std::vector<RowVectorPtr> batches = {
+      makeRowVector({
+          makeFlatVector<int32_t>({0, 0, 1}),
+          makeNullableFlatVector<int64_t>(
+              {10, std::nullopt, 30}),
+      }),
+      makeRowVector({
+          makeFlatVector<int32_t>({1, 1, 2}),
+          makeNullableFlatVector<int64_t>({4, std::nullopt, 100}),
+      }),
+  };
+
+  auto runGroupedSparkSum = [&](bool subOpEnabled) {
+    if (subOpEnabled) {
+      ::unsetenv(kEnv);
+    } else {
+      ASSERT_EQ(0, ::setenv(kEnv, "0", 1));
+    }
+    struct UnsetEnv {
+      const char* key;
+      bool enabled;
+      ~UnsetEnv() {
+        if (enabled) {
+          ::unsetenv(key);
+        }
+      }
+    } unset{kEnv, !subOpEnabled};
+
+    PlanBuilder builder(pool());
+    builder.values(batches);
+    builder.partialAggregation({"c0"}, {"spark_sum(c1)"}).finalAggregation();
+    return AssertQueryBuilder(builder.planNode()).copyResults(pool());
+  };
+
+  auto subOpResult = runGroupedSparkSum(true);
+  auto baseResult = runGroupedSparkSum(false);
+  ASSERT_TRUE(assertEqualResults({baseResult}, {subOpResult}));
+#endif
+}
+
+// Null constant bigint (mode2=2, mayHaveNulls): SVE null-mask path vs Base;
+// same env toggle as sumInt64SubOpSveMatchesBase.
+TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
+#else
+  constexpr const char* kEnv = "BOLT_SPARK_SUM_INT64_USE_SUBOP";
+
+  const std::vector<RowVectorPtr> batches = {
+      makeRowVector({
+          makeFlatVector<int32_t>({0, 0, 1}),
+          makeConstant<int64_t>(std::nullopt, 3),
+      }),
+      makeRowVector({
+          makeFlatVector<int32_t>({1, 2, 2}),
+          makeConstant<int64_t>(std::nullopt, 3),
+      }),
+  };
+
+  auto runGroupedSparkSum = [&](bool subOpEnabled) {
+    if (subOpEnabled) {
+      ::unsetenv(kEnv);
+    } else {
+      ASSERT_EQ(0, ::setenv(kEnv, "0", 1));
+    }
+    struct UnsetEnv {
+      const char* key;
+      bool enabled;
+      ~UnsetEnv() {
+        if (enabled) {
+          ::unsetenv(key);
+        }
+      }
+    } unset{kEnv, !subOpEnabled};
+
+    PlanBuilder builder(pool());
+    builder.values(batches);
+    builder.partialAggregation({"c0"}, {"spark_sum(c1)"}).finalAggregation();
+    return AssertQueryBuilder(builder.planNode()).copyResults(pool());
+  };
+
+  auto subOpResult = runGroupedSparkSum(true);
+  auto baseResult = runGroupedSparkSum(false);
+  ASSERT_TRUE(assertEqualResults({baseResult}, {subOpResult}));
+#endif
 }
 
 TEST_F(SumAggregationTest, hookLimits) {

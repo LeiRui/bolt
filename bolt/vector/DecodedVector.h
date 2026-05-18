@@ -243,6 +243,60 @@ class DecodedVector {
     return isConstantMapping_;
   }
 
+  // ---------------------------------------------------------------------------
+  // HashAgg batch update layout (Spark sum int64 SubOp and similar batch paths).
+  //
+  // Layout discriminators for HashAgg batch update kernels (nulls / indices).
+  // ISA-specific paths (e.g. AArch64 SVE) consume these; the API is not SVE-only.
+  // ---------------------------------------------------------------------------
+
+  /// Null layout: 0 = no combined null bitmask; 1 = identity or extra-nulls
+  /// on top-level rows; 2 = constant mapping; 3 = per-index nulls via indices.
+  int32_t hashAggNullsLayoutMode() const {
+    if (!nulls_) {
+      return 0;
+    }
+    if (isIdentityMapping_ || hasExtraNulls_) {
+      return 1;
+    }
+    if (isConstantMapping_) {
+      return 2;
+    }
+    return 3;
+  }
+
+  /// Index layout: 1 = identity; 2 = constant; 3 = general (dictionary) indices.
+  int32_t hashAggIndicesLayoutMode() const {
+    if (isIdentityMapping_) {
+      return 1;
+    }
+    if (isConstantMapping_) {
+      return 2;
+    }
+    BOLT_DCHECK(indices_);
+    return 3;
+  }
+
+  /// Mutable combined null bits (may be nullptr). See `hashAggNullsLayoutMode()`.
+  uint64_t* hashAggMutableCombinedNullBits() {
+    return const_cast<uint64_t*>(nulls_);
+  }
+
+  /// Base scalar data buffer; nullptr for complex types.
+  void* hashAggMutableRawData() {
+    return const_cast<void*>(data_);
+  }
+
+  /// Dictionary / general indices buffer; only meaningful when
+  /// `hashAggIndicesLayoutMode() == 3` (call forces `fillInIndices()` when lazy).
+  vector_size_t* hashAggMutableIndices() {
+    if (!indices_) {
+      fillInIndices();
+    }
+    BOLT_DCHECK(indices_);
+    return const_cast<vector_size_t*>(indices_);
+  }
+
   /////////////////////////////////////////////////////////////////
   /// BEGIN: Members that must only be used by PeeledEncoding class.
   /// See class comment for more details.
