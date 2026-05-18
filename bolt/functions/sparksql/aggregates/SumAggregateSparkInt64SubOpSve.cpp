@@ -502,6 +502,9 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
 
   const int32_t mode1 = decoded.hashAggNullsLayoutMode();
   const int32_t mode2 = decoded.hashAggIndicesLayoutMode();
+  if (mode2 == 2) {
+    return false;
+  }
   uint64_t* bitmap2 = decoded.hashAggMutableCombinedNullBits();
   int64_t* valueBuf = reinterpret_cast<int64_t*>(decoded.hashAggMutableRawData());
   uint32_t* dic = reinterpret_cast<uint32_t*>(decoded.hashAggMutableIndices());
