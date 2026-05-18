@@ -43,6 +43,8 @@ namespace bytedance::bolt::functions::aggregate::sparksql {
 
 namespace {
 
+constexpr uint64_t kSupportedSveVectorBytes = 32;
+
 template <typename T>
 inline bool isBitSet(const T* bits, uint64_t idx) {
   return bits[idx / (sizeof(bits[0]) * 8)] &
@@ -491,6 +493,13 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
     char** groups,
     const SelectivityVector& rows,
     ::bytedance::bolt::DecodedVector& decoded) {
+  // This kernel stores SVE predicates into four-byte scratch buffers and
+  // processes 32 rows per block. Use it only on 256-bit SVE; other VLs fall
+  // back to the scalar Base path in the caller.
+  if (svcntb() != kSupportedSveVectorBytes) {
+    return false;
+  }
+
   const int32_t mode1 = decoded.hashAggNullsLayoutMode();
   const int32_t mode2 = decoded.hashAggIndicesLayoutMode();
   uint64_t* bitmap2 = decoded.hashAggMutableCombinedNullBits();
