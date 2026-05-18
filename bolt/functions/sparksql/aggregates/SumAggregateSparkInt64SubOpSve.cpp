@@ -493,6 +493,11 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
     char** groups,
     const SelectivityVector& rows,
     ::bytedance::bolt::DecodedVector& decoded) {
+  using ::bytedance::bolt::functions::aggregate::Overflow;
+  BOLT_DCHECK(numNulls_);
+  BOLT_DCHECK(Overflow);
+  BOLT_DCHECK(decoded.mayHaveNulls());
+
   // This kernel stores SVE predicates into four-byte scratch buffers and
   // processes 32 rows per block. Use it only on 256-bit SVE; other VLs fall
   // back to the scalar Base path in the caller.
@@ -502,14 +507,22 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
 
   const int32_t mode1 = decoded.hashAggNullsLayoutMode();
   const int32_t mode2 = decoded.hashAggIndicesLayoutMode();
+  BOLT_DCHECK_GE(mode1, 0);
+  BOLT_DCHECK_LE(mode1, 3);
+  BOLT_DCHECK_GE(mode2, 1);
+  BOLT_DCHECK_LE(mode2, 3);
   if (mode2 == 2) {
     return false;
   }
   uint64_t* bitmap2 = decoded.hashAggMutableCombinedNullBits();
   int64_t* valueBuf = reinterpret_cast<int64_t*>(decoded.hashAggMutableRawData());
+  BOLT_DCHECK_NOT_NULL(valueBuf);
   uint32_t* dic = mode2 == 3
       ? reinterpret_cast<uint32_t*>(decoded.hashAggMutableIndices())
       : nullptr;
+  if (mode2 == 3) {
+    BOLT_DCHECK_NOT_NULL(dic);
+  }
 
   uint64_t* rowsBits = const_cast<uint64_t*>(rows.allBits());
   const vector_size_t begin = rows.begin();
@@ -518,10 +531,6 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
   auto getAccum = [this](char* group) -> int64_t* {
     return this->template value<int64_t>(group);
   };
-
-  // Constant index layout (mode2==2): non-null constants stay on Base because
-  // mayHaveNulls() is false. Nullable null constants (mode1==2) that reach SVE
-  // rely on sveDecodedNullMaskForMode to clear the block mask (no value adds).
 
   sveHashAggBatchUpdateGroupSums(
       nullByte_,
