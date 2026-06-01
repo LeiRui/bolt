@@ -238,7 +238,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
       }),
   };
 
-  auto runGroupedSparkSum = [&](bool subOpEnabled) {
+  auto runGroupedSparkSum = [&](bool subOpEnabled) -> RowVectorPtr {
     if (subOpEnabled) {
       ::unsetenv(kEnv);
     } else {
@@ -285,7 +285,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
       }),
   };
 
-  auto runGroupedSparkSum = [&](bool subOpEnabled) {
+  auto runGroupedSparkSum = [&](bool subOpEnabled) -> RowVectorPtr {
     if (subOpEnabled) {
       ::unsetenv(kEnv);
     } else {
