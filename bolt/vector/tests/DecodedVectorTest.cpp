@@ -1465,6 +1465,11 @@ TEST_F(DecodedVectorTest, hashAggLayoutModes) {
   EXPECT_EQ(0, decodedConst.hashAggNullsLayoutMode());
   EXPECT_EQ(2, decodedConst.hashAggIndicesLayoutMode());
 
+  auto nullConst = makeConstant<int64_t>(std::nullopt, 5);
+  DecodedVector decodedNullConst(*nullConst);
+  EXPECT_EQ(2, decodedNullConst.hashAggNullsLayoutMode());
+  EXPECT_EQ(2, decodedNullConst.hashAggIndicesLayoutMode());
+
   auto indices = makeIndices(5, [](auto row) { return row; });
   auto dict = BaseVector::wrapInDictionary(nullptr, indices, 5, flat);
   DecodedVector decodedDict(*dict);

@@ -132,6 +132,9 @@ TEST_F(SumAggregationTest, overflow) {
 // DuckDB parity: same SQL/input as reference. Spark sum(bigint) defaults to SubOp;
 // `BOLT_SPARK_SUM_INT64_USE_SUBOP=0` selects Base (see env test below).
 TEST_F(SumAggregationTest, sumInt64SubOpParity) {
+#if !defined(_WIN32)
+  ::unsetenv("BOLT_SPARK_SUM_INT64_USE_SUBOP");
+#endif
   auto globalInput =
       makeRowVector({makeFlatVector<int64_t>({7, 11, 13, -5, 2})});
   createDuckDbTable({globalInput});
@@ -201,6 +204,9 @@ TEST_F(SumAggregationTest, sumInt64SubOpEnvOffParity) {
 // **Linux AArch64 + SVE auxv**; on other hosts SubOp falls back to `SumAggregateBase`
 // and the DuckDB reference is unchanged.
 TEST_F(SumAggregationTest, sumInt64SubOpNullableSveGate) {
+#if !defined(_WIN32)
+  ::unsetenv("BOLT_SPARK_SUM_INT64_USE_SUBOP");
+#endif
   auto input = makeRowVector({
       makeFlatVector<int32_t>({0, 0, 1, 1, 1, 2}),
       makeNullableFlatVector<int64_t>(
@@ -242,7 +248,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
     if (subOpEnabled) {
       ::unsetenv(kEnv);
     } else {
-      ASSERT_EQ(0, ::setenv(kEnv, "0", 1));
+      CHECK_EQ(0, ::setenv(kEnv, "0", 1));
     }
     struct UnsetEnv {
       const char* key;
@@ -289,7 +295,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
     if (subOpEnabled) {
       ::unsetenv(kEnv);
     } else {
-      ASSERT_EQ(0, ::setenv(kEnv, "0", 1));
+      CHECK_EQ(0, ::setenv(kEnv, "0", 1));
     }
     struct UnsetEnv {
       const char* key;
