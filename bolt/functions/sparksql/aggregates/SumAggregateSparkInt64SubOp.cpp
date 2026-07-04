@@ -88,9 +88,7 @@ void SumAggregateSparkInt64SubOp::updateBatch(
   }
 
   const bool canUseSveKernel = sumInt64SubOpCanUseSveKernel();
-  const bool mayUseLazyHook =
-      mayPushdown && numNulls_ && !arg->type()->isDecimal();
-  if (!canUseSveKernel && !mayUseLazyHook) {
+  if (!canUseSveKernel) {
     if (intermediate) {
       Base::addIntermediateResults(groups, rows, args, mayPushdown);
     } else {
@@ -101,7 +99,9 @@ void SumAggregateSparkInt64SubOp::updateBatch(
 
   DecodedVector decoded(*arg, rows, !mayPushdown);
   const auto encoding = decoded.base()->encoding();
-  if (mayUseLazyHook && encoding == VectorEncoding::Simple::LAZY) {
+  // Match SimpleNumericAggregate::updateGroups: indirect lazy (e.g.
+  // Dictionary(Lazy)) uses SimpleCallableHook regardless of numNulls_.
+  if (UNLIKELY(encoding == VectorEncoding::Simple::LAZY)) {
     bytedance::bolt::aggregate::SimpleCallableHook<
         int64_t,
         int64_t,
@@ -119,10 +119,11 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     return;
   }
 
-  if (canUseSveKernel && updateGroupsFromDecoded(groups, rows, decoded)) {
+  if (updateGroupsFromDecoded(groups, rows, decoded)) {
     return;
   }
 
+  // unreachable when canUseSveKernel; kept for stub/defense
   if (intermediate) {
     Base::addIntermediateResults(groups, rows, args, mayPushdown);
   } else {
