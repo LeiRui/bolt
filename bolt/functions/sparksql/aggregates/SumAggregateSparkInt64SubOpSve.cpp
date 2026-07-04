@@ -217,6 +217,32 @@ static bool sveClearGroupNullFlags(
   return false;
 }
 
+template <typename GetAccumPtr>
+inline void sveAccumulateFlaggedRows(
+    int mode2,
+    int64_t* value,
+    uint32_t* dic,
+    const uint8_t* flag,
+    int32_t rowBase,
+    char** result,
+    GetAccumPtr&& getAccumPtr) {
+  for (int i = 0; i < 4; ++i) {
+    if (flag[i] == 0) {
+      continue;
+    }
+    const int32_t row = rowBase + i;
+    int64_t rowValue;
+    if (mode2 == 3) {
+      rowValue = value[dic[row]];
+    } else if (mode2 == 2) {
+      rowValue = value[0];
+    } else {
+      rowValue = value[row];
+    }
+    *getAccumPtr(*(result + row)) += rowValue;
+  }
+}
+
 template <typename GetPtr>
 static void sveHashAggBatchUpdateGroupSums(
       int32_t nullByte,
@@ -273,22 +299,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag0[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
           
-          // mode2==3: gather via dictionary indices; else flat row values.
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag0[i] != 0) {
-                uint32_t dictIndex = dic[count + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag0[i] != 0) {
-                *getAccumPtr(*(result + count + i)) += value[count + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag0, count, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask21)) {
@@ -299,21 +311,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag1[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag1[i] != 0) {
-                uint32_t dictIndex = dic[count + 4 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 4 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag1[i] != 0) {
-                *getAccumPtr(*(result + count + 4 + i)) += value[count + 4 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag1, count + 4, result, getAccumPtr);
         }
       }
       svbool_t mask11 = svunpkhi(mask00);
@@ -328,21 +327,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag2[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag2[i] != 0) {
-                uint32_t dictIndex = dic[count + 8 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 8 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag2[i] != 0) {
-                *getAccumPtr(*(result + count + 8 + i)) += value[count + 8 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag2, count + 8, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask23)) {
@@ -353,21 +339,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag3[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag3[i] != 0) {
-                uint32_t dictIndex = dic[count + 12 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 12 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag3[i] != 0) {
-                *getAccumPtr(*(result + count + 12 + i)) += value[count + 12 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag3, count + 12, result, getAccumPtr);
         }
       }
     }
@@ -386,21 +359,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag4[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag4[i] != 0) {
-                uint32_t dictIndex = dic[count + 16 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 16 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag4[i] != 0) {
-                *getAccumPtr(*(result + count + 16 + i)) += value[count + 16 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag4, count + 16, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask25)) {
@@ -411,21 +371,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag5[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag5[i] != 0) {
-                uint32_t dictIndex = dic[count + 20 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 20 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag5[i] != 0) {
-                *getAccumPtr(*(result + count + 20 + i)) += value[count + 20 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag5, count + 20, result, getAccumPtr);
         }
       }
       svbool_t mask13 = svunpkhi(mask01);
@@ -441,21 +388,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag6[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag6[i] != 0) {
-                uint32_t dictIndex = dic[count + 24 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 24 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag6[i] != 0) {
-                *getAccumPtr(*(result + count + 24 + i)) += value[count + 24 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag6, count + 24, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask27)) {
@@ -466,21 +400,8 @@ static void sveHashAggBatchUpdateGroupSums(
           uint8_t flag7[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
           
-          if (mode2 == 3) {
-            for (int i = 0; i < 4; i++) {
-              if (flag7[i] != 0) {
-                uint32_t dictIndex = dic[count + 28 + i];
-                int64_t dictValue = value[dictIndex];
-                *getAccumPtr(*(result + count + 28 + i)) += dictValue;
-              }
-            }
-          } else {
-            for (int i = 0; i < 4; i++) {
-              if (flag7[i] != 0) {
-                *getAccumPtr(*(result + count + 28 + i)) += value[count + 28 + i];
-              }
-            }
-          }
+          sveAccumulateFlaggedRows(
+              mode2, value, dic, flag7, count + 28, result, getAccumPtr);
         }
       }
     }
@@ -494,9 +415,7 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
     const SelectivityVector& rows,
     ::bytedance::bolt::DecodedVector& decoded) {
   using ::bytedance::bolt::functions::aggregate::Overflow;
-  BOLT_DCHECK(numNulls_);
   BOLT_DCHECK(Overflow);
-  BOLT_DCHECK(decoded.mayHaveNulls());
 
   // This kernel stores SVE predicates into four-byte scratch buffers and
   // processes 32 rows per block. Use it only on 256-bit SVE; other VLs fall
@@ -511,9 +430,6 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
   BOLT_DCHECK_LE(mode1, 3);
   BOLT_DCHECK_GE(mode2, 1);
   BOLT_DCHECK_LE(mode2, 3);
-  if (mode2 == 2) {
-    return false;
-  }
   uint64_t* bitmap2 = decoded.hashAggMutableCombinedNullBits();
   int64_t* valueBuf = reinterpret_cast<int64_t*>(decoded.hashAggMutableRawData());
   BOLT_DCHECK_NOT_NULL(valueBuf);
@@ -546,8 +462,8 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
       mode1,
       mode2,
       dic);
-  // On aarch64: batch handled by SVE; caller skips Base. Shape gating is upstream
-  // (`mayHaveNulls`, `numNulls_`, auxv).
+  // On aarch64: batch handled by SVE; caller skips Base. Shape gating is
+  // upstream (Overflow, auxv); null layout handled via mode1/mode2 in-kernel.
   return true;
 }
 
