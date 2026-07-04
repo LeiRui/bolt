@@ -37,10 +37,6 @@
 #include "bolt/vector/LazyVector.h"
 #include "bolt/vector/VectorEncoding.h"
 
-#if defined(__aarch64__) && defined(__linux__)
-#include <sys/auxv.h>
-#endif
-
 namespace bytedance::bolt::functions::aggregate::sparksql {
 
 namespace {
@@ -53,26 +49,13 @@ static void sparkSumInt64UpdateSingle(int64_t& result, int64_t value) {
   }
 }
 
-#if defined(__aarch64__) && defined(__linux__)
-// SVE is advertised on AT_HWCAP (HWCAP_SVE), not AT_HWCAP2 — see Linux
-// arch/arm64/include/uapi/asm/hwcap.h.
-#ifndef HWCAP_SVE
-constexpr unsigned long kBoltHwcapSve = 1UL << 22;
-#else
-constexpr unsigned long kBoltHwcapSve = HWCAP_SVE;
-#endif
+} // namespace
 
-static bool linuxAarch64RuntimeHasSve() {
-  const unsigned long hwcap = getauxval(AT_HWCAP);
-  return (hwcap & kBoltHwcapSve) != 0;
-}
-#else
-static bool linuxAarch64RuntimeHasSve() {
+#if !defined(__aarch64__) || !defined(__linux__)
+bool sumInt64SubOpCanUseSveKernel() {
   return false;
 }
 #endif
-
-} // namespace
 
 SumAggregateSparkInt64SubOp::SumAggregateSparkInt64SubOp(TypePtr resultType)
     : Base(std::move(resultType)) {}
@@ -104,10 +87,21 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     return;
   }
 
+  const bool canUseSveKernel = sumInt64SubOpCanUseSveKernel();
+  const bool mayUseLazyHook =
+      mayPushdown && numNulls_ && !arg->type()->isDecimal();
+  if (!canUseSveKernel && !mayUseLazyHook) {
+    if (intermediate) {
+      Base::addIntermediateResults(groups, rows, args, mayPushdown);
+    } else {
+      Base::addRawInput(groups, rows, args, mayPushdown);
+    }
+    return;
+  }
+
   DecodedVector decoded(*arg, rows, !mayPushdown);
   const auto encoding = decoded.base()->encoding();
-  if (mayPushdown && encoding == VectorEncoding::Simple::LAZY &&
-      !arg->type()->isDecimal() && numNulls_) {
+  if (mayUseLazyHook && encoding == VectorEncoding::Simple::LAZY) {
     bytedance::bolt::aggregate::SimpleCallableHook<
         int64_t,
         int64_t,
@@ -125,12 +119,9 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     return;
   }
 
-#if defined(__aarch64__)
-  if (linuxAarch64RuntimeHasSve() &&
-      updateGroupsFromDecoded(groups, rows, decoded)) {
+  if (canUseSveKernel && updateGroupsFromDecoded(groups, rows, decoded)) {
     return;
   }
-#endif
 
   if (intermediate) {
     Base::addIntermediateResults(groups, rows, args, mayPushdown);
