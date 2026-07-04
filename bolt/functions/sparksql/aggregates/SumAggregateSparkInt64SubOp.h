@@ -39,9 +39,11 @@ class DecodedVector;
 namespace bytedance::bolt::functions::aggregate::sparksql {
 
 /// Spark sum(bigint)->bigint SubOp (default unless `BOLT_SPARK_SUM_INT64_USE_SUBOP`
-/// is off; see `SumAggregate.cpp`). When `numNulls_`, Spark overflow gate, and
-/// `decoded.mayHaveNulls()` hold, runs the AArch64 SVE batch kernel; otherwise
-/// defers to `SumAggregateBase`.
+/// is off; see `SumAggregate.cpp`). For Spark int64 sum with overflow checking,
+/// runs the AArch64 SVE batch kernel when runtime SVE is available; handles
+/// with/without accumulator nulls and with/without input nulls via `numNulls_`
+/// and decoded layout modes. Falls back to `SumAggregateBase` when SVE is
+/// unavailable or the batch shape is unsupported (e.g. non-256-bit SVE VL).
 class SumAggregateSparkInt64SubOp
     : public ::bytedance::bolt::functions::aggregate::SumAggregateBase<
           int64_t,
@@ -75,6 +77,13 @@ class SumAggregateSparkInt64SubOp
       char** groups,
       const SelectivityVector& rows,
       ::bytedance::bolt::DecodedVector& decoded);
+
+  void updateBatch(
+      char** groups,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool mayPushdown,
+      bool intermediate);
 };
 
 } // namespace bytedance::bolt::functions::aggregate::sparksql
