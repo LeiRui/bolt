@@ -68,32 +68,27 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     bool intermediate) {
   const auto& arg = args[0];
 
-  if (mayPushdown && arg->isLazy()) {
+  auto delegateToBase = [&]() {
     if (intermediate) {
       Base::addIntermediateResults(groups, rows, args, mayPushdown);
     } else {
       Base::addRawInput(groups, rows, args, mayPushdown);
     }
+  };
+
+  if (mayPushdown && arg->isLazy()) {
+    delegateToBase();
     return;
   }
 
   using ::bytedance::bolt::functions::aggregate::Overflow;
   if (!Overflow) {
-    if (intermediate) {
-      Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    } else {
-      Base::addRawInput(groups, rows, args, mayPushdown);
-    }
+    delegateToBase();
     return;
   }
 
-  const bool canUseSveKernel = sumInt64SubOpCanUseSveKernel();
-  if (!canUseSveKernel) {
-    if (intermediate) {
-      Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    } else {
-      Base::addRawInput(groups, rows, args, mayPushdown);
-    }
+  if (!sumInt64SubOpCanUseSveKernel()) {
+    delegateToBase();
     return;
   }
 
@@ -124,11 +119,7 @@ void SumAggregateSparkInt64SubOp::updateBatch(
   }
 
   // unreachable when canUseSveKernel; kept for stub/defense
-  if (intermediate) {
-    Base::addIntermediateResults(groups, rows, args, mayPushdown);
-  } else {
-    Base::addRawInput(groups, rows, args, mayPushdown);
-  }
+  delegateToBase();
 }
 
 void SumAggregateSparkInt64SubOp::addRawInput(
