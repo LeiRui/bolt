@@ -199,10 +199,8 @@ TEST_F(SumAggregationTest, sumInt64SubOpEnvOffParity) {
 #endif
 }
 
-// Nullable grouped bigint: `decoded.mayHaveNulls()` is true; with table-side null
-// groups (`numNulls_`) and Spark overflow gate this hits the SubOp SVE path on
-// **Linux AArch64 + SVE auxv**; on other hosts SubOp falls back to `SumAggregateBase`
-// and the DuckDB reference is unchanged.
+// Nullable grouped bigint: exercises SVE null-mask + group-null clearing on
+// **Linux AArch64 + SVE auxv**; on other hosts SubOp falls back to Base.
 TEST_F(SumAggregationTest, sumInt64SubOpNullableSveGate) {
 #if !defined(_WIN32)
   ::unsetenv("BOLT_SPARK_SUM_INT64_USE_SUBOP");
@@ -272,8 +270,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
 #endif
 }
 
-// Null constant bigint (mode2=2, mayHaveNulls): SVE null-mask path vs Base;
-// same env toggle as sumInt64SubOpSveMatchesBase.
+// Null constant bigint (mode2=2, mayHaveNulls): SVE null-mask path vs Base.
 TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -288,6 +285,100 @@ TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
       makeRowVector({
           makeFlatVector<int32_t>({1, 2, 2}),
           makeConstant<int64_t>(std::nullopt, 3),
+      }),
+  };
+
+  auto runGroupedSparkSum = [&](bool subOpEnabled) -> RowVectorPtr {
+    if (subOpEnabled) {
+      ::unsetenv(kEnv);
+    } else {
+      CHECK_EQ(0, ::setenv(kEnv, "0", 1));
+    }
+    struct UnsetEnv {
+      const char* key;
+      bool enabled;
+      ~UnsetEnv() {
+        if (enabled) {
+          ::unsetenv(key);
+        }
+      }
+    } unset{kEnv, !subOpEnabled};
+
+    PlanBuilder builder(pool());
+    builder.values(batches);
+    builder.partialAggregation({"c0"}, {"spark_sum(c1)"}).finalAggregation();
+    return AssertQueryBuilder(builder.planNode()).copyResults(pool());
+  };
+
+  auto subOpResult = runGroupedSparkSum(true);
+  auto baseResult = runGroupedSparkSum(false);
+  ASSERT_TRUE(assertEqualResults({baseResult}, {subOpResult}));
+#endif
+}
+
+// Non-null flat bigint (`mayHaveNulls()==false`): PR #52-style decouple must
+// still match Base (covers no-null input + optional no-null groups).
+TEST_F(SumAggregationTest, sumInt64SubOpNonNullFlatMatchesBase) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
+#else
+  constexpr const char* kEnv = "BOLT_SPARK_SUM_INT64_USE_SUBOP";
+
+  const std::vector<RowVectorPtr> batches = {
+      makeRowVector({
+          makeFlatVector<int32_t>({0, 0, 1, 1}),
+          makeFlatVector<int64_t>({10, 20, 30, 40}),
+      }),
+      makeRowVector({
+          makeFlatVector<int32_t>({1, 2, 2, 2}),
+          makeFlatVector<int64_t>({50, 100, 200, 300}),
+      }),
+  };
+
+  auto runGroupedSparkSum = [&](bool subOpEnabled) -> RowVectorPtr {
+    if (subOpEnabled) {
+      ::unsetenv(kEnv);
+    } else {
+      CHECK_EQ(0, ::setenv(kEnv, "0", 1));
+    }
+    struct UnsetEnv {
+      const char* key;
+      bool enabled;
+      ~UnsetEnv() {
+        if (enabled) {
+          ::unsetenv(key);
+        }
+      }
+    } unset{kEnv, !subOpEnabled};
+
+    PlanBuilder builder(pool());
+    builder.values(batches);
+    builder.partialAggregation({"c0"}, {"spark_sum(c1)"}).finalAggregation();
+    return AssertQueryBuilder(builder.planNode()).copyResults(pool());
+  };
+
+  auto subOpResult = runGroupedSparkSum(true);
+  auto baseResult = runGroupedSparkSum(false);
+  ASSERT_TRUE(assertEqualResults({baseResult}, {subOpResult}));
+#endif
+}
+
+// Non-null constant bigint (mode2=2, `mayHaveNulls()==false`): decouple exposes
+// this shape to SVE; must match Base (getValueForRow uses value[0]).
+TEST_F(SumAggregationTest, sumInt64SubOpNonNullConstMatchesBase) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
+#else
+  constexpr const char* kEnv = "BOLT_SPARK_SUM_INT64_USE_SUBOP";
+
+  const std::vector<RowVectorPtr> batches = {
+      makeRowVector({
+          makeFlatVector<int32_t>({0, 0, 1, 1}),
+          makeConstant<int64_t>(7, 4),
+      }),
+      makeRowVector({
+          makeFlatVector<int32_t>({2, 2, 2, 2}),
+          makeConstant<int64_t>(11, 4),
       }),
   };
 

@@ -77,53 +77,74 @@ static bool linuxAarch64RuntimeHasSve() {
 SumAggregateSparkInt64SubOp::SumAggregateSparkInt64SubOp(TypePtr resultType)
     : Base(std::move(resultType)) {}
 
+void SumAggregateSparkInt64SubOp::updateBatch(
+    char** groups,
+    const SelectivityVector& rows,
+    const std::vector<VectorPtr>& args,
+    bool mayPushdown,
+    bool intermediate) {
+  const auto& arg = args[0];
+
+  if (mayPushdown && arg->isLazy()) {
+    if (intermediate) {
+      Base::addIntermediateResults(groups, rows, args, mayPushdown);
+    } else {
+      Base::addRawInput(groups, rows, args, mayPushdown);
+    }
+    return;
+  }
+
+  using ::bytedance::bolt::functions::aggregate::Overflow;
+  if (!Overflow) {
+    if (intermediate) {
+      Base::addIntermediateResults(groups, rows, args, mayPushdown);
+    } else {
+      Base::addRawInput(groups, rows, args, mayPushdown);
+    }
+    return;
+  }
+
+  DecodedVector decoded(*arg, rows, !mayPushdown);
+  const auto encoding = decoded.base()->encoding();
+  if (mayPushdown && encoding == VectorEncoding::Simple::LAZY &&
+      !arg->type()->isDecimal() && numNulls_) {
+    bytedance::bolt::aggregate::SimpleCallableHook<
+        int64_t,
+        int64_t,
+        void (*)(int64_t&, int64_t)>
+        hook(
+            offset_,
+            nullByte_,
+            nullMask_,
+            groups,
+            &numNulls_,
+            sparkSumInt64UpdateSingle);
+    auto indices = decoded.indices();
+    decoded.base()->as<const LazyVector>()->load(
+        ::bytedance::bolt::RowSet(indices, arg->size()), &hook);
+    return;
+  }
+
+#if defined(__aarch64__)
+  if (linuxAarch64RuntimeHasSve() &&
+      updateGroupsFromDecoded(groups, rows, decoded)) {
+    return;
+  }
+#endif
+
+  if (intermediate) {
+    Base::addIntermediateResults(groups, rows, args, mayPushdown);
+  } else {
+    Base::addRawInput(groups, rows, args, mayPushdown);
+  }
+}
+
 void SumAggregateSparkInt64SubOp::addRawInput(
     char** groups,
     const SelectivityVector& rows,
     const std::vector<VectorPtr>& args,
     bool mayPushdown) {
-  const auto& arg = args[0];
-
-  if (mayPushdown && arg->isLazy()) {
-    Base::addRawInput(groups, rows, args, mayPushdown);
-    return;
-  }
-
-  using ::bytedance::bolt::functions::aggregate::Overflow;
-  if (this->numNulls_ && Overflow) {
-    DecodedVector decoded(*arg, rows, !mayPushdown);
-    const auto encoding = decoded.base()->encoding();
-    if (mayPushdown && encoding == VectorEncoding::Simple::LAZY &&
-        !arg->type()->isDecimal()) {
-      bytedance::bolt::aggregate::SimpleCallableHook<
-          int64_t,
-          int64_t,
-          void (*)(int64_t&, int64_t)>
-          hook(
-              offset_,
-              nullByte_,
-              nullMask_,
-              groups,
-              &numNulls_,
-              sparkSumInt64UpdateSingle);
-      auto indices = decoded.indices();
-      decoded.base()->as<const LazyVector>()->load(
-          ::bytedance::bolt::RowSet(indices, arg->size()), &hook);
-      return;
-    }
-    if (decoded.mayHaveNulls()) {
-#if defined(__aarch64__)
-      if (linuxAarch64RuntimeHasSve() &&
-          updateGroupsFromDecoded(groups, rows, decoded)) {
-        return;
-      }
-#endif
-    }
-    Base::addRawInput(groups, rows, args, mayPushdown);
-    return;
-  }
-
-  Base::addRawInput(groups, rows, args, mayPushdown);
+  updateBatch(groups, rows, args, mayPushdown, false);
 }
 
 void SumAggregateSparkInt64SubOp::addIntermediateResults(
@@ -131,48 +152,7 @@ void SumAggregateSparkInt64SubOp::addIntermediateResults(
     const SelectivityVector& rows,
     const std::vector<VectorPtr>& args,
     bool mayPushdown) {
-  const auto& arg = args[0];
-
-  if (mayPushdown && arg->isLazy()) {
-    Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    return;
-  }
-
-  using ::bytedance::bolt::functions::aggregate::Overflow;
-  if (this->numNulls_ && Overflow) {
-    DecodedVector decoded(*arg, rows, !mayPushdown);
-    const auto encoding = decoded.base()->encoding();
-    if (mayPushdown && encoding == VectorEncoding::Simple::LAZY &&
-        !arg->type()->isDecimal()) {
-      bytedance::bolt::aggregate::SimpleCallableHook<
-          int64_t,
-          int64_t,
-          void (*)(int64_t&, int64_t)>
-          hook(
-              offset_,
-              nullByte_,
-              nullMask_,
-              groups,
-              &numNulls_,
-              sparkSumInt64UpdateSingle);
-      auto indices = decoded.indices();
-      decoded.base()->as<const LazyVector>()->load(
-          ::bytedance::bolt::RowSet(indices, arg->size()), &hook);
-      return;
-    }
-    if (decoded.mayHaveNulls()) {
-#if defined(__aarch64__)
-      if (linuxAarch64RuntimeHasSve() &&
-          updateGroupsFromDecoded(groups, rows, decoded)) {
-        return;
-      }
-#endif
-    }
-    Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    return;
-  }
-
-  Base::addIntermediateResults(groups, rows, args, mayPushdown);
+  updateBatch(groups, rows, args, mayPushdown, true);
 }
 
 #if !defined(__aarch64__)
