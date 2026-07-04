@@ -35,6 +35,10 @@
 
 #include <arm_sve.h>
 
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+
 #include "bolt/vector/BaseVector.h"
 #include "bolt/vector/DecodedVector.h"
 #include "bolt/vector/SelectivityVector.h"
@@ -220,6 +224,7 @@ static bool sveClearGroupNullFlags(
 template <typename GetAccumPtr>
 inline void sveAccumulateFlaggedRows(
     int mode2,
+    int64_t mode2ConstValue,
     int64_t* value,
     uint32_t* dic,
     const uint8_t* flag,
@@ -235,7 +240,7 @@ inline void sveAccumulateFlaggedRows(
     if (mode2 == 3) {
       rowValue = value[dic[row]];
     } else if (mode2 == 2) {
-      rowValue = value[0];
+      rowValue = mode2ConstValue;
     } else {
       rowValue = value[row];
     }
@@ -265,6 +270,7 @@ static void sveHashAggBatchUpdateGroupSums(
       roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
   int32_t lastWord = roundUp(end, 32);
   svbool_t mask, mask1;
+  const int64_t mode2ConstValue = mode2 == 2 ? value[0] : 0;
   // Process 32 logical rows per iteration; `count` is the row index.
   for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
     int32_t arr8Index = count / 8;
@@ -300,7 +306,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag0, count, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag0, count, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask21)) {
@@ -312,7 +318,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag1, count + 4, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag1, count + 4, result, getAccumPtr);
         }
       }
       svbool_t mask11 = svunpkhi(mask00);
@@ -328,7 +334,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag2, count + 8, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag2, count + 8, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask23)) {
@@ -340,7 +346,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag3, count + 12, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag3, count + 12, result, getAccumPtr);
         }
       }
     }
@@ -360,7 +366,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag4, count + 16, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag4, count + 16, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask25)) {
@@ -372,7 +378,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag5, count + 20, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag5, count + 20, result, getAccumPtr);
         }
       }
       svbool_t mask13 = svunpkhi(mask01);
@@ -389,7 +395,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag6, count + 24, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag6, count + 24, result, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask27)) {
@@ -401,7 +407,7 @@ static void sveHashAggBatchUpdateGroupSums(
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
           
           sveAccumulateFlaggedRows(
-              mode2, value, dic, flag7, count + 28, result, getAccumPtr);
+              mode2, mode2ConstValue, value, dic, flag7, count + 28, result, getAccumPtr);
         }
       }
     }
@@ -416,13 +422,9 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
     ::bytedance::bolt::DecodedVector& decoded) {
   using ::bytedance::bolt::functions::aggregate::Overflow;
   BOLT_DCHECK(Overflow);
+  BOLT_DCHECK(sumInt64SubOpCanUseSveKernel());
 
-  // This kernel stores SVE predicates into four-byte scratch buffers and
-  // processes 32 rows per block. Use it only on 256-bit SVE; other VLs fall
-  // back to the scalar Base path in the caller.
-  if (svcntb() != kSupportedSveVectorBytes) {
-    return false;
-  }
+  // Kernel is only invoked when `sumInt64SubOpCanUseSveKernel()` is true.
 
   const int32_t mode1 = decoded.hashAggNullsLayoutMode();
   const int32_t mode2 = decoded.hashAggIndicesLayoutMode();
@@ -465,6 +467,24 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
   // On aarch64: batch handled by SVE; caller skips Base. Shape gating is
   // upstream (Overflow, auxv); null layout handled via mode1/mode2 in-kernel.
   return true;
+}
+
+bool sumInt64SubOpCanUseSveKernel() {
+  static const bool kCanUse = []() {
+#if defined(__linux__)
+#ifndef HWCAP_SVE
+    constexpr unsigned long kBoltHwcapSve = 1UL << 22;
+#else
+    constexpr unsigned long kBoltHwcapSve = HWCAP_SVE;
+#endif
+    const unsigned long hwcap = getauxval(AT_HWCAP);
+    if ((hwcap & kBoltHwcapSve) == 0) {
+      return false;
+    }
+#endif
+    return svcntb() == kSupportedSveVectorBytes;
+  }();
+  return kCanUse;
 }
 
 } // namespace bytedance::bolt::functions::aggregate::sparksql

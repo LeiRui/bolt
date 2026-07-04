@@ -38,6 +38,10 @@ class DecodedVector;
 
 namespace bytedance::bolt::functions::aggregate::sparksql {
 
+/// True when Linux aarch64 runtime has SVE and the current vector length matches
+/// the compiled 256-bit kernel (`svcntb() == 32`). Result is cached per process.
+bool sumInt64SubOpCanUseSveKernel();
+
 /// Spark sum(bigint)->bigint SubOp (default unless `BOLT_SPARK_SUM_INT64_USE_SUBOP`
 /// is off; see `SumAggregate.cpp`). For Spark int64 sum with overflow checking,
 /// runs the AArch64 SVE batch kernel when runtime SVE is available; handles
