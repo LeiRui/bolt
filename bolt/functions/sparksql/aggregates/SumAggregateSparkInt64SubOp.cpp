@@ -68,40 +68,35 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     bool intermediate) {
   const auto& arg = args[0];
 
-  if (mayPushdown && arg->isLazy()) {
+  auto delegateToBase = [&]() {
     if (intermediate) {
       Base::addIntermediateResults(groups, rows, args, mayPushdown);
     } else {
       Base::addRawInput(groups, rows, args, mayPushdown);
     }
+  };
+
+  if (mayPushdown && arg->isLazy()) {
+    delegateToBase();
     return;
   }
 
   using ::bytedance::bolt::functions::aggregate::Overflow;
   if (!Overflow) {
-    if (intermediate) {
-      Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    } else {
-      Base::addRawInput(groups, rows, args, mayPushdown);
-    }
+    delegateToBase();
     return;
   }
 
-  const bool canUseSveKernel = sumInt64SubOpCanUseSveKernel();
-  const bool mayUseLazyHook =
-      mayPushdown && numNulls_ && !arg->type()->isDecimal();
-  if (!canUseSveKernel && !mayUseLazyHook) {
-    if (intermediate) {
-      Base::addIntermediateResults(groups, rows, args, mayPushdown);
-    } else {
-      Base::addRawInput(groups, rows, args, mayPushdown);
-    }
+  if (!sumInt64SubOpCanUseSveKernel()) {
+    delegateToBase();
     return;
   }
 
   DecodedVector decoded(*arg, rows, !mayPushdown);
   const auto encoding = decoded.base()->encoding();
-  if (mayUseLazyHook && encoding == VectorEncoding::Simple::LAZY) {
+  // Match SimpleNumericAggregate::updateGroups: indirect lazy (e.g.
+  // Dictionary(Lazy)) uses SimpleCallableHook regardless of numNulls_.
+  if (UNLIKELY(encoding == VectorEncoding::Simple::LAZY)) {
     bytedance::bolt::aggregate::SimpleCallableHook<
         int64_t,
         int64_t,
@@ -119,15 +114,12 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     return;
   }
 
-  if (canUseSveKernel && updateGroupsFromDecoded(groups, rows, decoded)) {
+  if (updateGroupsFromDecoded(groups, rows, decoded)) {
     return;
   }
 
-  if (intermediate) {
-    Base::addIntermediateResults(groups, rows, args, mayPushdown);
-  } else {
-    Base::addRawInput(groups, rows, args, mayPushdown);
-  }
+  // unreachable when canUseSveKernel; kept for stub/defense
+  delegateToBase();
 }
 
 void SumAggregateSparkInt64SubOp::addRawInput(

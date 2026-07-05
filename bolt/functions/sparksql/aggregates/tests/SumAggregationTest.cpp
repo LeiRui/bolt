@@ -52,6 +52,9 @@ class SumAggregationTest : public SumTestBase {
   static constexpr const char* kSumInt64SubOpEnv =
       "BOLT_SPARK_SUM_INT64_USE_SUBOP";
 
+  // Runs partial+final grouped spark_sum twice (SubOp default vs env=0 Base).
+  // On Linux aarch64 + 256-bit SVE, SubOp exercises the SVE kernel; elsewhere
+  // SubOp delegates to Base and this still checks parity.
   void expectSparkSumInt64SubOpMatchesBase(
       const std::vector<RowVectorPtr>& batches) {
     auto runGroupedSparkSum = [&](bool subOpEnabled) -> RowVectorPtr {
@@ -233,8 +236,9 @@ TEST_F(SumAggregationTest, sumInt64SubOpEnvOffParity) {
 #endif
 }
 
-// Nullable grouped bigint: exercises SVE null-mask + group-null clearing on
-// **Linux AArch64 + SVE auxv**; on other hosts SubOp falls back to Base.
+// Nullable grouped bigint vs DuckDB. On Linux aarch64 + 256-bit SVE the default
+// SubOp uses the SVE kernel; on other hosts SubOp matches Base (no SVE). Name
+// retains legacy "SveGate" — decouple removed outer mayHaveNulls/numNulls gates.
 TEST_F(SumAggregationTest, sumInt64SubOpNullableSveGate) {
 #if !defined(_WIN32)
   ::unsetenv("BOLT_SPARK_SUM_INT64_USE_SUBOP");
@@ -255,9 +259,8 @@ TEST_F(SumAggregationTest, sumInt64SubOpNullableSveGate) {
       false);
 }
 
-// Same nullable grouped input: default SubOp (SVE on Linux aarch64 + auxv) vs
-// `BOLT_SPARK_SUM_INT64_USE_SUBOP=0` (Base). Final partial+final results must
-// match; catches SVE vs scalar divergence without relying on DuckDB alone.
+// Nullable flat grouped input: SubOp (SVE when canUseSveKernel) vs Base env=0.
+// Complements DuckDB parity tests; catches SVE vs scalar divergence.
 TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -382,8 +385,8 @@ TEST_F(SumAggregationTest, sumInt64SubOpNumNullsZeroNullableInputMatchesBase) {
 #endif
 }
 
-// partialAggregation + finalAggregation exercises addIntermediateResults on the
-// final stage with dictionary-encoded values.
+// Two-batch dictionary (mode2=3) with different index patterns per batch.
+// Same partial+final plan as other expectSparkSumInt64SubOpMatchesBase tests.
 TEST_F(SumAggregationTest, sumInt64SubOpIntermediateDictionaryMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
