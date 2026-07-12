@@ -1453,37 +1453,54 @@ TEST_F(DecodedVectorTest, previousIndicesInReUsedDecodedVector) {
   EXPECT_EQ(rawIndices[0], 0);
 }
 
-TEST_F(DecodedVectorTest, hashAggLayoutModes) {
-  // Layout mode discriminators for HashAgg batch paths.
+TEST_F(DecodedVectorTest, batchLayout) {
   auto flat = makeFlatVector<int64_t>(10, [](auto row) { return row * 3; });
   DecodedVector decodedFlat(*flat);
-  EXPECT_EQ(0, decodedFlat.hashAggNullsLayoutMode());
-  EXPECT_EQ(1, decodedFlat.hashAggIndicesLayoutMode());
+  auto layoutFlat = decodedFlat.batchLayout();
+  EXPECT_TRUE(layoutFlat.isReady());
+  EXPECT_EQ(0, layoutFlat.nullsMode);
+  EXPECT_EQ(1, layoutFlat.indicesMode);
+  EXPECT_EQ(nullptr, layoutFlat.nulls);
+  ASSERT_NE(nullptr, layoutFlat.data);
+  EXPECT_EQ(nullptr, layoutFlat.indices);
 
   auto constVec = makeConstant<int64_t>(42, 7);
   DecodedVector decodedConst(*constVec);
-  EXPECT_EQ(0, decodedConst.hashAggNullsLayoutMode());
-  EXPECT_EQ(2, decodedConst.hashAggIndicesLayoutMode());
+  auto layoutConst = decodedConst.batchLayout();
+  EXPECT_TRUE(layoutConst.isReady());
+  EXPECT_EQ(0, layoutConst.nullsMode);
+  EXPECT_EQ(2, layoutConst.indicesMode);
+  EXPECT_EQ(0, layoutConst.constantIndex);
+  ASSERT_NE(nullptr, layoutConst.data);
+  EXPECT_EQ(nullptr, layoutConst.indices);
 
   auto nullConst = makeConstant<int64_t>(std::nullopt, 5);
   DecodedVector decodedNullConst(*nullConst);
-  EXPECT_EQ(2, decodedNullConst.hashAggNullsLayoutMode());
-  EXPECT_EQ(2, decodedNullConst.hashAggIndicesLayoutMode());
+  auto layoutNullConst = decodedNullConst.batchLayout();
+  EXPECT_TRUE(layoutNullConst.isReady());
+  EXPECT_EQ(2, layoutNullConst.nullsMode);
+  EXPECT_EQ(2, layoutNullConst.indicesMode);
+  EXPECT_EQ(0, layoutNullConst.constantIndex);
+  ASSERT_NE(nullptr, layoutNullConst.nulls);
 
   auto indices = makeIndices(5, [](auto row) { return row; });
   auto dict = BaseVector::wrapInDictionary(nullptr, indices, 5, flat);
   DecodedVector decodedDict(*dict);
-  EXPECT_EQ(0, decodedDict.hashAggNullsLayoutMode());
-  EXPECT_EQ(3, decodedDict.hashAggIndicesLayoutMode());
-  ASSERT_NE(nullptr, decodedDict.hashAggMutableIndices());
-  ASSERT_NE(nullptr, decodedDict.hashAggMutableRawData());
+  auto layoutDict = decodedDict.batchLayout();
+  EXPECT_TRUE(layoutDict.isReady());
+  EXPECT_EQ(0, layoutDict.nullsMode);
+  EXPECT_EQ(3, layoutDict.indicesMode);
+  ASSERT_NE(nullptr, layoutDict.data);
+  ASSERT_NE(nullptr, layoutDict.indices);
 
   auto nullableFlat =
       makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, 5});
   DecodedVector decodedNullable(*nullableFlat);
-  EXPECT_EQ(1, decodedNullable.hashAggNullsLayoutMode());
-  EXPECT_EQ(1, decodedNullable.hashAggIndicesLayoutMode());
-  ASSERT_NE(nullptr, decodedNullable.hashAggMutableCombinedNullBits());
+  auto layoutNullable = decodedNullable.batchLayout();
+  EXPECT_TRUE(layoutNullable.isReady());
+  EXPECT_EQ(1, layoutNullable.nullsMode);
+  EXPECT_EQ(1, layoutNullable.indicesMode);
+  ASSERT_NE(nullptr, layoutNullable.nulls);
 
   SelectivityVector rows(8, false);
   rows.setValid(2, true);

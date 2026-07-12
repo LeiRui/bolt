@@ -262,6 +262,7 @@ static void sveHashAggBatchUpdateGroupSums(
       int32_t end,
       int mode1,
       int mode2,
+      vector_size_t constantValueIndex,
       uint32_t* dic) {
   uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
   uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
@@ -270,7 +271,8 @@ static void sveHashAggBatchUpdateGroupSums(
       roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
   int32_t lastWord = roundUp(end, 32);
   svbool_t mask, mask1;
-  const int64_t mode2ConstValue = mode2 == 2 ? value[0] : 0;
+  const int64_t mode2ConstValue =
+      mode2 == 2 ? value[constantValueIndex] : 0;
   // Process 32 logical rows per iteration; `count` is the row index.
   for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
     int32_t arr8Index = count / 8;
@@ -424,23 +426,16 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
   BOLT_DCHECK(Overflow);
   BOLT_DCHECK(sumInt64SubOpCanUseSveKernel());
 
-  // Kernel is only invoked when `sumInt64SubOpCanUseSveKernel()` is true.
+  const auto layout = decoded.batchLayout();
+  BOLT_DCHECK(layout.isReady());
 
-  const int32_t mode1 = decoded.hashAggNullsLayoutMode();
-  const int32_t mode2 = decoded.hashAggIndicesLayoutMode();
-  BOLT_DCHECK_GE(mode1, 0);
-  BOLT_DCHECK_LE(mode1, 3);
-  BOLT_DCHECK_GE(mode2, 1);
-  BOLT_DCHECK_LE(mode2, 3);
-  uint64_t* bitmap2 = decoded.hashAggMutableCombinedNullBits();
-  int64_t* valueBuf = reinterpret_cast<int64_t*>(decoded.hashAggMutableRawData());
-  BOLT_DCHECK_NOT_NULL(valueBuf);
-  uint32_t* dic = mode2 == 3
-      ? reinterpret_cast<uint32_t*>(decoded.hashAggMutableIndices())
+  const int32_t mode1 = layout.nullsMode;
+  const int32_t mode2 = layout.indicesMode;
+  uint64_t* bitmap2 = const_cast<uint64_t*>(layout.nulls);
+  int64_t* valueBuf = const_cast<int64_t*>(static_cast<const int64_t*>(layout.data));
+  uint32_t* dic = layout.indicesMode == 3
+      ? const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(layout.indices))
       : nullptr;
-  if (mode2 == 3) {
-    BOLT_DCHECK_NOT_NULL(dic);
-  }
 
   uint64_t* rowsBits = const_cast<uint64_t*>(rows.allBits());
   const vector_size_t begin = rows.begin();
@@ -463,9 +458,10 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
       end,
       mode1,
       mode2,
+      layout.constantIndex,
       dic);
   // On aarch64: batch handled by SVE; caller skips Base. Shape gating is
-  // upstream (Overflow, auxv); null layout handled via mode1/mode2 in-kernel.
+  // upstream (Overflow, auxv); layout from DecodedVector::batchLayout().
   return true;
 }
 

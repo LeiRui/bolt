@@ -467,6 +467,20 @@ const uint64_t* DecodedVector::nulls(const SelectivityVector* rows) {
   return allNulls_.value();
 }
 
+BatchLayout DecodedVector::batchLayout() {
+  BatchLayout layout;
+  layout.nullsMode = nullsLayoutMode();
+  layout.indicesMode = indicesLayoutMode();
+  layout.nulls = nulls_;
+  layout.data = data_;
+  if (layout.indicesMode == 2) {
+    layout.constantIndex = constantIndex_;
+  } else if (layout.indicesMode == 3) {
+    layout.indices = indices();
+  }
+  return layout;
+}
+
 template <typename Func>
 void DecodedVector::applyToRows(const SelectivityVector* rows, Func&& func)
     const {
