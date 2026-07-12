@@ -281,7 +281,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpSveMatchesBase) {
 #endif
 }
 
-// Null constant bigint (mode2=2, mayHaveNulls): SVE null-mask path vs Base.
+// Null constant bigint (indicesMode=2, mayHaveNulls): SVE null-mask path vs Base.
 TEST_F(SumAggregationTest, sumInt64SubOpNullConstMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -322,8 +322,8 @@ TEST_F(SumAggregationTest, sumInt64SubOpNonNullFlatMatchesBase) {
 #endif
 }
 
-// Non-null constant bigint (mode2=2, `mayHaveNulls()==false`): decouple exposes
-// this shape to SVE; must match Base (getValueForRow uses value[0]).
+// Non-null constant bigint (indicesMode=2, `mayHaveNulls()==false`): decouple
+// exposes this shape to SVE; must match Base (uses value[constantIndex]).
 TEST_F(SumAggregationTest, sumInt64SubOpNonNullConstMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -343,7 +343,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpNonNullConstMatchesBase) {
 #endif
 }
 
-// Dictionary bigint (mode2=3): gather via `value[dic[row]]`.
+// Dictionary bigint (indicesMode=3): gather via `value[indices[row]]`.
 TEST_F(SumAggregationTest, sumInt64SubOpDictionaryMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -365,7 +365,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpDictionaryMatchesBase) {
 }
 
 // After batch 1 clears group-null flags (`numNulls_==0`), batch 2 still handles
-// nullable flat input via SVE `mode1` masks.
+// nullable flat input via SVE nullsMode=1 masks.
 TEST_F(SumAggregationTest, sumInt64SubOpNumNullsZeroNullableInputMatchesBase) {
 #if defined(_WIN32)
   GTEST_SKIP() << "BOLT_SPARK_SUM_INT64_USE_SUBOP uses POSIX setenv/unsetenv";
@@ -385,7 +385,7 @@ TEST_F(SumAggregationTest, sumInt64SubOpNumNullsZeroNullableInputMatchesBase) {
 #endif
 }
 
-// Two-batch dictionary (mode2=3) with different index patterns per batch.
+// Two-batch dictionary (indicesMode=3) with different index patterns per batch.
 // Same partial+final plan as other expectSparkSumInt64SubOpMatchesBase tests.
 TEST_F(SumAggregationTest, sumInt64SubOpIntermediateDictionaryMatchesBase) {
 #if defined(_WIN32)

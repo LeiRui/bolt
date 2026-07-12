@@ -118,7 +118,7 @@ void SumAggregateSparkInt64SubOp::updateBatch(
     return;
   }
 
-  // unreachable when canUseSveKernel; kept for stub/defense
+  // Stub/defense when SVE TU is not linked.
   delegateToBase();
 }
 
