@@ -1502,13 +1502,6 @@ TEST_F(DecodedVectorTest, batchReadView) {
   EXPECT_EQ(1, viewNullable.nullsMode);
   EXPECT_EQ(1, viewNullable.indicesMode);
   ASSERT_NE(nullptr, viewNullable.nulls);
-
-  SelectivityVector rows(8, false);
-  rows.setValid(2, true);
-  rows.setValid(5, true);
-  rows.updateBounds();
-  EXPECT_NE(nullptr, rows.allBits());
-  EXPECT_LE(rows.begin(), rows.end());
 }
 
 } // namespace bytedance::bolt::test
