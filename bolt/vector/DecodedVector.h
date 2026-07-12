@@ -37,16 +37,15 @@
 #include "bolt/vector/SelectivityVector.h"
 namespace bytedance::bolt {
 
-/// Contract for batch kernels that read a decoded scalar vector via `nulls_`,
-/// `data_`, and optional `indices_`. Obtain with `DecodedVector::batchLayout()`.
-/// Not interchangeable with `nulls(rows)` (top-level materialized bitmap).
-struct BatchLayout {
+/// Non-owning read view for batch kernels over decoded scalar data. Mode
+/// integers are copied from `nullsLayoutMode()` / `indicesLayoutMode()`.
+struct BatchReadView {
   int32_t nullsMode{0};
   int32_t indicesMode{0};
   const uint64_t* nulls{nullptr};
   const void* data{nullptr};
   const vector_size_t* indices{nullptr};
-  /// `data` index for `indicesMode == 2` (same as `index(row)`). Otherwise 0.
+  /// `data` index when `indicesMode == 2` (same as `index(row)`). Otherwise 0.
   vector_size_t constantIndex{0};
 
   /// True when `data` is set and dictionary mode has `indices`.
@@ -267,9 +266,11 @@ class DecodedVector {
     return isConstantMapping_;
   }
 
-  /// Batch read contract for kernels (SVE and similar). Requires materialized
-  /// `data_` (complete decode, not lazy constant stub).
-  BatchLayout batchLayout();
+  /// Read view for batch kernels. Requires materialized `data_` (complete decode,
+  /// not lazy constant stub). Populates modes from `nullsLayoutMode()` /
+  /// `indicesLayoutMode()` (aligned with `isNullAt()` / `index(row)`; not
+  /// `nulls(rows)`).
+  BatchReadView batchReadView();
 
   /////////////////////////////////////////////////////////////////
   /// BEGIN: Members that must only be used by PeeledEncoding class.
@@ -394,6 +395,15 @@ class DecodedVector {
   template <typename Func>
   void applyToRows(const SelectivityVector* rows, Func&& func) const;
 
+  // ---------------------------------------------------------------------------
+  // Batch-kernel layout modes (feed `BatchReadView`). Raw `nulls_` + mode, not
+  // the materialized top-level bitmap from `nulls(rows)`.
+  // ---------------------------------------------------------------------------
+
+  /// Null dispatch for batch kernels. Aligns with `isNullAt(row)` branches:
+  /// 0 = no nulls (`!nulls_`); 1 = identity or extra-nulls on top-level rows
+  /// (`isBitNull(nulls_, row)`); 2 = constant mapping (`isBitNull(nulls_, 0)`);
+  /// 3 = dictionary (`isBitNull(nulls_, indices_[row])`).
   int32_t nullsLayoutMode() const {
     if (!nulls_) {
       return 0; // no nulls
@@ -407,6 +417,9 @@ class DecodedVector {
     return 3; // nulls_[indices_[row]]
   }
 
+  /// Value dispatch for batch kernels. Same branches as `index(row)` /
+  /// `valueAt(row)`: 1 = flat (`value[row]`); 2 = constant
+  /// (`value[constantIndex_]`); 3 = dictionary (`value[indices_[row]]`).
   int32_t indicesLayoutMode() const {
     if (isIdentityMapping_) {
       return 1; // row

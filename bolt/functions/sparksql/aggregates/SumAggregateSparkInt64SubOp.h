@@ -46,8 +46,8 @@ bool sumInt64SubOpCanUseSveKernel();
 /// is off; see `SumAggregate.cpp`). For Spark int64 sum with overflow checking,
 /// runs the AArch64 SVE batch kernel when runtime SVE is available; handles
 /// with/without accumulator nulls and with/without input nulls via `numNulls_`
-/// and decoded layout modes. Falls back to `SumAggregateBase` when SVE is
-/// unavailable or the batch shape is unsupported (e.g. non-256-bit SVE VL).
+/// and `BatchReadView` dispatch modes. Falls back to `SumAggregateBase` when SVE
+/// is unavailable or the batch shape is unsupported (e.g. non-256-bit SVE VL).
 class SumAggregateSparkInt64SubOp
     : public ::bytedance::bolt::functions::aggregate::SumAggregateBase<
           int64_t,
@@ -74,9 +74,10 @@ class SumAggregateSparkInt64SubOp
       bool mayPushdown) override;
 
  private:
-  /// Applies `sveHashAggBatchUpdateGroupSums` for one decoded batch.
-  /// Returns true when the SVE path was taken (caller must not invoke Base for
-  /// this batch). Returns false only on non-aarch64 stub builds.
+  /// Adapter for one decoded batch: `HashAggGroupSink` + `SelectedBatchReadView`
+  /// → `sveHashAggBatchUpdateGroupSums`. Returns true when the SVE path was
+  /// taken (caller must not invoke Base). Returns false only on non-aarch64
+  /// stub builds.
   bool updateGroupsFromDecoded(
       char** groups,
       const SelectivityVector& rows,

@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  *
  * AArch64 SVE batch kernel for Spark sum(bigint) HashAgg group updates.
+ * `updateGroupsFromDecoded` (member) builds glue structs and calls
+ * `sveHashAggBatchUpdateGroupSums` (anonymous namespace kernel).
  * Compiled only on aarch64 (see aggregates/CMakeLists.txt, `-march=armv8-a+sve`).
  */
 
@@ -49,39 +51,58 @@ namespace {
 
 constexpr uint64_t kSupportedSveVectorBytes = 32;
 
+/// Test one bit in a packed bitmap (used by `isBitNull` for constant-null mode).
 template <typename T>
 inline bool isBitSet(const T* bits, uint64_t idx) {
   return bits[idx / (sizeof(bits[0]) * 8)] &
       (static_cast<T>(1) << (idx & ((sizeof(bits[0]) * 8) - 1)));
 }
 
+/// True when bit `index` is cleared (Velox/Bolt null-bit convention).
 inline bool isBitNull(const uint64_t* bits, int32_t index) {
   return isBitSet(bits, index) == false;
 }
+/// Round `value` up to a multiple of `factor` (32-row chunk alignment).
 template <typename T, typename U>
 constexpr inline T roundUp(T value, U factor) {
   return (value + (factor - 1)) / factor * factor;
 }
 
-svbool_t sveDecodedNullMaskForMode(
-    uint8_t* nulls_,
+/// HashAgg group write side: clear null flags and update int64 accumulators.
+struct HashAggGroupSink {
+  int32_t nullByte;
+  uint8_t nullMask;
+  uint64_t* numNulls;
+  char** groups;
+};
+
+/// Active rows (`SelectivityVector`) plus decoded values (`BatchReadView`).
+struct SelectedBatchReadView {
+  const ::bytedance::bolt::SelectivityVector& rows;
+  ::bytedance::bolt::BatchReadView readView;
+};
+
+/// Builds an 8-byte-lane predicate for input nulls per `nullsMode`
+/// (`BatchReadView::nullsMode`). Used to form `inputNullMask` in the main kernel.
+svbool_t sveInputNullMaskForMode(
+    const uint8_t* nulls_,
     int32_t index,
-    int mode,
-    uint32_t* dic,
+    int nullsMode,
+    const uint32_t* dictIndices,
     int32_t length) {
   svbool_t pg;
-  if (mode == 0) {
+  if (nullsMode == 0) {
     pg = svptrue_b8();
     return pg;
-  } else if (mode == 1) {
+  } else if (nullsMode == 1) {
     __asm__ __volatile__("ldr %0, [%1]"
                          : "=Upl"(pg)
                          : "r"(&(nulls_[index]))
                          : "memory");
     return pg;
-  } else if (mode == 2) {
+  } else if (nullsMode == 2) {
     if (!isBitNull(
-            reinterpret_cast<uint64_t*>(nulls_),
+            reinterpret_cast<const uint64_t*>(nulls_),
             0))
     {
       pg = svptrue_b8();
@@ -89,20 +110,20 @@ svbool_t sveDecodedNullMaskForMode(
       pg = svpfalse();
     }
     return pg;
-  } else if (mode == 3) {
+  } else if (nullsMode == 3) {
 
     svuint32_t onc = svdup_u32(1);
     svuint32_t inv = svindex_u32(0, 1);
     svuint32_t pow = svlsl_m(svptrue_b32(), onc, inv);
     uint8_t tmpNulls[4] = {0};
-    uint32_t* null32ptr = reinterpret_cast<uint32_t*>(nulls_);
+    const uint32_t* null32ptr = reinterpret_cast<const uint32_t*>(nulls_);
 
     svuint32_t posv, idxbufv, bufv, offsetv;
     svbool_t nullvec, pg1;
 
-    // mode1==3: pack null bits for eight dictionary lanes (chunk 0).
+    // nullsMode==3: pack null bits for eight dictionary lanes (chunk 0).
     pg1 = svwhilelt_b32(index * 8, length);
-    posv = svld1(pg1, dic + index * 8);
+    posv = svld1(pg1, dictIndices + index * 8);
     idxbufv = svlsr_x(pg1, posv, 5); // u32 word index (pos / 32)
     bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
     offsetv = svand_m(pg1, posv, 0b11111); // bit index within the u32 word
@@ -116,9 +137,9 @@ svbool_t sveDecodedNullMaskForMode(
       tmpNulls[0] = 0;
     }
 
-    // mode1==3: dictionary null bits (chunk 1).
+    // nullsMode==3: dictionary null bits (chunk 1).
     pg1 = svwhilelt_b32(index * 8 + 8, length);
-    posv = svld1(pg1, dic + index * 8 + 8);
+    posv = svld1(pg1, dictIndices + index * 8 + 8);
     idxbufv = svlsr_x(pg1, posv, 5);
     bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
     offsetv = svand_m(pg1, posv, 0b11111);
@@ -132,9 +153,9 @@ svbool_t sveDecodedNullMaskForMode(
       tmpNulls[1] = 0;
     }
 
-    // mode1==3: dictionary null bits (chunk 2).
+    // nullsMode==3: dictionary null bits (chunk 2).
     pg1 = svwhilelt_b32(index * 8 + 16, length);
-    posv = svld1(pg1, dic + index * 8 + 16);
+    posv = svld1(pg1, dictIndices + index * 8 + 16);
     idxbufv = svlsr_x(pg1, posv, 5);
     bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
     offsetv = svand_m(pg1, posv, 0b11111);
@@ -148,9 +169,9 @@ svbool_t sveDecodedNullMaskForMode(
       tmpNulls[2] = 0;
     }
 
-    // mode1==3: dictionary null bits (chunk 3).
+    // nullsMode==3: dictionary null bits (chunk 3).
     pg1 = svwhilelt_b32(index * 8 + 24, length);
-    posv = svld1(pg1, dic + index * 8 + 24);
+    posv = svld1(pg1, dictIndices + index * 8 + 24);
     idxbufv = svlsr_x(pg1, posv, 5);
     bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
     offsetv = svand_m(pg1, posv, 0b11111);
@@ -170,13 +191,15 @@ svbool_t sveDecodedNullMaskForMode(
                          : "memory");
     return pg;
   }
-  // Unknown mode1: inactive predicate.
+  // Unknown nullsMode: inactive predicate.
   pg = svpfalse();
   return pg;
 }
 
+/// Among four loaded group pointers, keep only lanes whose pointer differs from
+/// earlier lanes in the quad (HashAgg duplicate-group guard within one SVE step).
 inline __attribute__((always_inline)) svbool_t
-sveMaskDistinctGroupSlots(svbool_t pg, const svuint64_t val) {
+sveMaskDistinctGroupPtrs(svbool_t pg, const svuint64_t val) {
   svuint64_t s1 = svext_u64(val, val, 1);
   svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 3), val, s1);
 
@@ -193,6 +216,8 @@ sveMaskDistinctGroupSlots(svbool_t pg, const svuint64_t val) {
   return mask;
 }
 
+/// Clears accumulator null flags on groups about to receive a non-null update.
+/// Vectorized counterpart of `Aggregate::clearNullFlags` for active SVE lanes.
 static bool sveClearGroupNullFlags(
     int32_t nullByte,
     uint8_t nullMask,
@@ -221,15 +246,17 @@ static bool sveClearGroupNullFlags(
   return false;
 }
 
+/// Scalar tail: add input values into group sums for up to four rows. `flag[i]`
+/// comes from unpacking an SVE lane mask (`mask20` etc.); no SVE intrinsics here.
 template <typename GetAccumPtr>
-inline void sveAccumulateFlaggedRows(
-    int mode2,
-    int64_t mode2ConstValue,
-    int64_t* value,
-    uint32_t* dic,
+inline void accumulateGroupSumsFromLaneFlags(
+    int indicesMode,
+    int64_t constantValue,
+    const int64_t* values,
+    const uint32_t* dictIndices,
     const uint8_t* flag,
     int32_t rowBase,
-    char** result,
+    char** groups,
     GetAccumPtr&& getAccumPtr) {
   for (int i = 0; i < 4; ++i) {
     if (flag[i] == 0) {
@@ -237,56 +264,61 @@ inline void sveAccumulateFlaggedRows(
     }
     const int32_t row = rowBase + i;
     int64_t rowValue;
-    if (mode2 == 3) {
-      rowValue = value[dic[row]];
-    } else if (mode2 == 2) {
-      rowValue = mode2ConstValue;
+    if (indicesMode == 3) {
+      rowValue = values[dictIndices[row]];
+    } else if (indicesMode == 2) {
+      rowValue = constantValue;
     } else {
-      rowValue = value[row];
+      rowValue = values[row];
     }
-    *getAccumPtr(*(result + row)) += rowValue;
+    *getAccumPtr(*(groups + row)) += rowValue;
   }
 }
 
+/// HashAgg Spark sum(bigint) SVE batch kernel: 32-row blocks, group-pointer
+/// dedup, null-flag clearing, and per-lane scalar accumulation.
 template <typename GetPtr>
 static void sveHashAggBatchUpdateGroupSums(
-      int32_t nullByte,
-      uint8_t nullMask,
-      uint64_t* numNulls,
-      GetPtr&& getAccumPtr,
-      char** result,
-      uint64_t* bitmap1,
-      uint64_t* bitmap2,
-      int64_t* value,
-      int32_t begin,
-      int32_t end,
-      int mode1,
-      int mode2,
-      vector_size_t constantValueIndex,
-      uint32_t* dic) {
-  uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
-  uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+    const HashAggGroupSink& sink,
+    const SelectedBatchReadView& input,
+    GetPtr&& getAccumPtr) {
+  const auto& readView = input.readView;
+  const int32_t begin = static_cast<int32_t>(input.rows.begin());
+  const int32_t end = static_cast<int32_t>(input.rows.end());
+  const int32_t nullsMode = readView.nullsMode;
+  const int32_t indicesMode = readView.indicesMode;
+  const auto* values = static_cast<const int64_t*>(readView.data);
+  const auto* dictIndices = indicesMode == 3
+      ? reinterpret_cast<const uint32_t*>(readView.indices)
+      : nullptr;
+  const uint8_t* rowBits8 =
+      reinterpret_cast<const uint8_t*>(input.rows.allBits());
+  const uint8_t* inputNullBits8 = readView.nulls != nullptr
+      ? reinterpret_cast<const uint8_t*>(readView.nulls)
+      : nullptr;
+  char** groups = sink.groups;
 
   int32_t firstWord =
       roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
   int32_t lastWord = roundUp(end, 32);
-  svbool_t mask, mask1;
-  const int64_t mode2ConstValue =
-      mode2 == 2 ? value[constantValueIndex] : 0;
+  svbool_t mask, rowMask;
+  const int64_t constantValue =
+      indicesMode == 2 ? values[readView.constantIndex] : 0;
   // Process 32 logical rows per iteration; `count` is the row index.
   for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
     int32_t arr8Index = count / 8;
-    svbool_t mask2;
-    if (bitmap2_8 != nullptr) {
-      mask2 = sveDecodedNullMaskForMode(bitmap2_8, arr8Index, mode1, dic, end);
+    svbool_t inputNullMask;
+    if (inputNullBits8 != nullptr) {
+      inputNullMask = sveInputNullMaskForMode(
+          inputNullBits8, arr8Index, nullsMode, dictIndices, end);
     } else {
-      mask2 = svptrue_b8();
+      inputNullMask = svptrue_b8();
     }
     __asm__ __volatile__("ldr %0, [%1]"
-                         : "=Upl"(mask1)
-                         : "r"(&bitmap1_8[arr8Index])
+                         : "=Upl"(rowMask)
+                         : "r"(&rowBits8[arr8Index])
                          : "memory");
-    mask = svand_b_z(svptrue_b8(), mask1, mask2);
+    mask = svand_b_z(svptrue_b8(), rowMask, inputNullMask);
     mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
     if (!svptest_any(svptrue_b8(), mask)) {
       continue;
@@ -301,26 +333,28 @@ static void sveHashAggBatchUpdateGroupSums(
         svbool_t mask21 = svunpkhi(mask10);
         if (svptest_any(svptrue_b64(), mask20)) {
           svuint64_t ptr =
-              svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
-          svbool_t m20 = sveMaskDistinctGroupSlots(mask20, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m20);
+              svld1(mask20, reinterpret_cast<uint64_t*>(groups + count));
+          svbool_t m20 = sveMaskDistinctGroupPtrs(mask20, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m20);
           uint8_t flag0[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag0, count, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag0, count, groups, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask21)) {
           svuint64_t ptr =
-              svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
-          svbool_t m21 = sveMaskDistinctGroupSlots(mask21, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m21);
+              svld1(mask21, reinterpret_cast<uint64_t*>(groups + count + 4));
+          svbool_t m21 = sveMaskDistinctGroupPtrs(mask21, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m21);
           uint8_t flag1[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag1, count + 4, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag1, count + 4, groups, getAccumPtr);
         }
       }
       svbool_t mask11 = svunpkhi(mask00);
@@ -329,26 +363,28 @@ static void sveHashAggBatchUpdateGroupSums(
         svbool_t mask23 = svunpkhi(mask11);
         if (svptest_any(svptrue_b64(), mask22)) {
           svuint64_t ptr =
-              svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
-          svbool_t m22 = sveMaskDistinctGroupSlots(mask22, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m22);
+              svld1(mask22, reinterpret_cast<uint64_t*>(groups + count + 8));
+          svbool_t m22 = sveMaskDistinctGroupPtrs(mask22, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m22);
           uint8_t flag2[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag2, count + 8, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag2, count + 8, groups, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask23)) {
           svuint64_t ptr =
-              svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
-          svbool_t m23 = sveMaskDistinctGroupSlots(mask23, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m23);
+              svld1(mask23, reinterpret_cast<uint64_t*>(groups + count + 12));
+          svbool_t m23 = sveMaskDistinctGroupPtrs(mask23, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m23);
           uint8_t flag3[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag3, count + 12, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag3, count + 12, groups, getAccumPtr);
         }
       }
     }
@@ -361,26 +397,28 @@ static void sveHashAggBatchUpdateGroupSums(
       if (svptest_any(svptrue_b32(), mask12)) {
         if (svptest_any(svptrue_b64(), mask24)) {
           svuint64_t ptr =
-              svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
-          svbool_t m24 = sveMaskDistinctGroupSlots(mask24, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m24);
+              svld1(mask24, reinterpret_cast<uint64_t*>(groups + count + 16));
+          svbool_t m24 = sveMaskDistinctGroupPtrs(mask24, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m24);
           uint8_t flag4[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag4, count + 16, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag4, count + 16, groups, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask25)) {
           svuint64_t ptr =
-              svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
-          svbool_t m25 = sveMaskDistinctGroupSlots(mask25, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m25);
+              svld1(mask25, reinterpret_cast<uint64_t*>(groups + count + 20));
+          svbool_t m25 = sveMaskDistinctGroupPtrs(mask25, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m25);
           uint8_t flag5[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag5, count + 20, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag5, count + 20, groups, getAccumPtr);
         }
       }
       svbool_t mask13 = svunpkhi(mask01);
@@ -390,26 +428,28 @@ static void sveHashAggBatchUpdateGroupSums(
         svbool_t mask27 = svunpkhi(mask13);
         if (svptest_any(svptrue_b64(), mask26)) {
           svuint64_t ptr =
-              svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
-          svbool_t m26 = sveMaskDistinctGroupSlots(mask26, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m26);
+              svld1(mask26, reinterpret_cast<uint64_t*>(groups + count + 24));
+          svbool_t m26 = sveMaskDistinctGroupPtrs(mask26, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m26);
           uint8_t flag6[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag6, count + 24, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag6, count + 24, groups, getAccumPtr);
         }
 
         if (svptest_any(svptrue_b64(), mask27)) {
           svuint64_t ptr =
-              svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
-          svbool_t m27 = sveMaskDistinctGroupSlots(mask27, ptr);
-          sveClearGroupNullFlags(nullByte, nullMask, numNulls, ptr, m27);
+              svld1(mask27, reinterpret_cast<uint64_t*>(groups + count + 28));
+          svbool_t m27 = sveMaskDistinctGroupPtrs(mask27, ptr);
+          sveClearGroupNullFlags(
+              sink.nullByte, sink.nullMask, sink.numNulls, ptr, m27);
           uint8_t flag7[4] = {0, 0, 0, 0};
           __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
           
-          sveAccumulateFlaggedRows(
-              mode2, mode2ConstValue, value, dic, flag7, count + 28, result, getAccumPtr);
+          accumulateGroupSumsFromLaneFlags(
+              indicesMode, constantValue, values, dictIndices, flag7, count + 28, groups, getAccumPtr);
         }
       }
     }
@@ -426,42 +466,17 @@ bool SumAggregateSparkInt64SubOp::updateGroupsFromDecoded(
   BOLT_DCHECK(Overflow);
   BOLT_DCHECK(sumInt64SubOpCanUseSveKernel());
 
-  const auto layout = decoded.batchLayout();
-  BOLT_DCHECK(layout.isReady());
-
-  const int32_t mode1 = layout.nullsMode;
-  const int32_t mode2 = layout.indicesMode;
-  uint64_t* bitmap2 = const_cast<uint64_t*>(layout.nulls);
-  int64_t* valueBuf = const_cast<int64_t*>(static_cast<const int64_t*>(layout.data));
-  uint32_t* dic = layout.indicesMode == 3
-      ? const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(layout.indices))
-      : nullptr;
-
-  uint64_t* rowsBits = const_cast<uint64_t*>(rows.allBits());
-  const vector_size_t begin = rows.begin();
-  const vector_size_t end = rows.end();
+  const auto readView = decoded.batchReadView();
+  BOLT_DCHECK(readView.isReady());
 
   auto getAccum = [this](char* group) -> int64_t* {
     return this->template value<int64_t>(group);
   };
 
   sveHashAggBatchUpdateGroupSums(
-      nullByte_,
-      nullMask_,
-      &numNulls_,
-      getAccum,
-      groups,
-      rowsBits,
-      bitmap2,
-      valueBuf,
-      begin,
-      end,
-      mode1,
-      mode2,
-      layout.constantIndex,
-      dic);
-  // On aarch64: batch handled by SVE; caller skips Base. Shape gating is
-  // upstream (Overflow, auxv); layout from DecodedVector::batchLayout().
+      HashAggGroupSink{nullByte_, nullMask_, &numNulls_, groups},
+      SelectedBatchReadView{rows, readView},
+      getAccum);
   return true;
 }
 

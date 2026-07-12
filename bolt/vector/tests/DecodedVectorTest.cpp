@@ -1453,54 +1453,55 @@ TEST_F(DecodedVectorTest, previousIndicesInReUsedDecodedVector) {
   EXPECT_EQ(rawIndices[0], 0);
 }
 
-TEST_F(DecodedVectorTest, batchLayout) {
+// batchReadView() modes for flat, constant, dictionary, and nullable encodings.
+TEST_F(DecodedVectorTest, batchReadView) {
   auto flat = makeFlatVector<int64_t>(10, [](auto row) { return row * 3; });
   DecodedVector decodedFlat(*flat);
-  auto layoutFlat = decodedFlat.batchLayout();
-  EXPECT_TRUE(layoutFlat.isReady());
-  EXPECT_EQ(0, layoutFlat.nullsMode);
-  EXPECT_EQ(1, layoutFlat.indicesMode);
-  EXPECT_EQ(nullptr, layoutFlat.nulls);
-  ASSERT_NE(nullptr, layoutFlat.data);
-  EXPECT_EQ(nullptr, layoutFlat.indices);
+  auto viewFlat = decodedFlat.batchReadView();
+  EXPECT_TRUE(viewFlat.isReady());
+  EXPECT_EQ(0, viewFlat.nullsMode);
+  EXPECT_EQ(1, viewFlat.indicesMode);
+  EXPECT_EQ(nullptr, viewFlat.nulls);
+  ASSERT_NE(nullptr, viewFlat.data);
+  EXPECT_EQ(nullptr, viewFlat.indices);
 
   auto constVec = makeConstant<int64_t>(42, 7);
   DecodedVector decodedConst(*constVec);
-  auto layoutConst = decodedConst.batchLayout();
-  EXPECT_TRUE(layoutConst.isReady());
-  EXPECT_EQ(0, layoutConst.nullsMode);
-  EXPECT_EQ(2, layoutConst.indicesMode);
-  EXPECT_EQ(0, layoutConst.constantIndex);
-  ASSERT_NE(nullptr, layoutConst.data);
-  EXPECT_EQ(nullptr, layoutConst.indices);
+  auto viewConst = decodedConst.batchReadView();
+  EXPECT_TRUE(viewConst.isReady());
+  EXPECT_EQ(0, viewConst.nullsMode);
+  EXPECT_EQ(2, viewConst.indicesMode);
+  EXPECT_EQ(0, viewConst.constantIndex);
+  ASSERT_NE(nullptr, viewConst.data);
+  EXPECT_EQ(nullptr, viewConst.indices);
 
   auto nullConst = makeConstant<int64_t>(std::nullopt, 5);
   DecodedVector decodedNullConst(*nullConst);
-  auto layoutNullConst = decodedNullConst.batchLayout();
-  EXPECT_TRUE(layoutNullConst.isReady());
-  EXPECT_EQ(2, layoutNullConst.nullsMode);
-  EXPECT_EQ(2, layoutNullConst.indicesMode);
-  EXPECT_EQ(0, layoutNullConst.constantIndex);
-  ASSERT_NE(nullptr, layoutNullConst.nulls);
+  auto viewNullConst = decodedNullConst.batchReadView();
+  EXPECT_TRUE(viewNullConst.isReady());
+  EXPECT_EQ(2, viewNullConst.nullsMode);
+  EXPECT_EQ(2, viewNullConst.indicesMode);
+  EXPECT_EQ(0, viewNullConst.constantIndex);
+  ASSERT_NE(nullptr, viewNullConst.nulls);
 
   auto indices = makeIndices(5, [](auto row) { return row; });
   auto dict = BaseVector::wrapInDictionary(nullptr, indices, 5, flat);
   DecodedVector decodedDict(*dict);
-  auto layoutDict = decodedDict.batchLayout();
-  EXPECT_TRUE(layoutDict.isReady());
-  EXPECT_EQ(0, layoutDict.nullsMode);
-  EXPECT_EQ(3, layoutDict.indicesMode);
-  ASSERT_NE(nullptr, layoutDict.data);
-  ASSERT_NE(nullptr, layoutDict.indices);
+  auto viewDict = decodedDict.batchReadView();
+  EXPECT_TRUE(viewDict.isReady());
+  EXPECT_EQ(0, viewDict.nullsMode);
+  EXPECT_EQ(3, viewDict.indicesMode);
+  ASSERT_NE(nullptr, viewDict.data);
+  ASSERT_NE(nullptr, viewDict.indices);
 
   auto nullableFlat =
       makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, 5});
   DecodedVector decodedNullable(*nullableFlat);
-  auto layoutNullable = decodedNullable.batchLayout();
-  EXPECT_TRUE(layoutNullable.isReady());
-  EXPECT_EQ(1, layoutNullable.nullsMode);
-  EXPECT_EQ(1, layoutNullable.indicesMode);
-  ASSERT_NE(nullptr, layoutNullable.nulls);
+  auto viewNullable = decodedNullable.batchReadView();
+  EXPECT_TRUE(viewNullable.isReady());
+  EXPECT_EQ(1, viewNullable.nullsMode);
+  EXPECT_EQ(1, viewNullable.indicesMode);
+  ASSERT_NE(nullptr, viewNullable.nulls);
 
   SelectivityVector rows(8, false);
   rows.setValid(2, true);

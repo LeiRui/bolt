@@ -467,18 +467,18 @@ const uint64_t* DecodedVector::nulls(const SelectivityVector* rows) {
   return allNulls_.value();
 }
 
-BatchLayout DecodedVector::batchLayout() {
-  BatchLayout layout;
-  layout.nullsMode = nullsLayoutMode();
-  layout.indicesMode = indicesLayoutMode();
-  layout.nulls = nulls_;
-  layout.data = data_;
-  if (layout.indicesMode == 2) {
-    layout.constantIndex = constantIndex_;
-  } else if (layout.indicesMode == 3) {
-    layout.indices = indices();
+BatchReadView DecodedVector::batchReadView() {
+  BatchReadView view;
+  view.nullsMode = nullsLayoutMode();
+  view.indicesMode = indicesLayoutMode();
+  view.nulls = nulls_;
+  view.data = data_;
+  if (view.indicesMode == 2) {
+    view.constantIndex = constantIndex_;
+  } else if (view.indicesMode == 3) {
+    view.indices = indices();
   }
-  return layout;
+  return view;
 }
 
 template <typename Func>
