@@ -43,9 +43,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
   list(APPEND BOLT_SPARK_SUM_INT64_SUBOP_SVE SumAggregateSparkInt64SubOpSve.cpp)
 endif()
 
+set(PERCENTILE_TYPES
+    "TypeKind::TINYINT"
+    "TypeKind::SMALLINT"
+    "TypeKind::INTEGER"
+    "TypeKind::BIGINT"
+    "TypeKind::HUGEINT"
+    "TypeKind::REAL"
+    "TypeKind::DOUBLE"
+    "TypeKind::VARCHAR"
+)
+specialize_template(
+  PERCENTILE_GENERATED_FILES PercentileAggregate.cpp.in ${PERCENTILE_TYPES}
+)
+
+set(MIN_MAX_BY_TYPES
+    "bool"
+    "int8_t"
+    "int16_t"
+    "int32_t"
+    "int64_t"
+    "int128_t"
+    "float"
+    "double"
+    "StringView"
+    "Timestamp"
+    "ComplexType"
+)
+specialize_template(
+  MIN_MAX_BY_GENERATED_FILES MinMaxByAggregate.cpp.in ${MIN_MAX_BY_TYPES}
+)
+
 bolt_add_library(
   bolt_functions_spark_aggregates
   ${PAAGG_GENERATED_FILES}
+  ${PERCENTILE_GENERATED_FILES}
+  ${MIN_MAX_BY_GENERATED_FILES}
   AverageAggregate.cpp
   BitwiseXorAggregate.cpp
   BloomFilterAggAggregate.cpp
@@ -56,6 +89,7 @@ bolt_add_library(
   MinMaxByAggregate.cpp
   ModeAggregate.cpp
   PercentileApproxAggregate.cpp
+  PercentileAggregate.cpp
   Register.cpp
   RegrReplacementAggregate.cpp
   SumAggregateSparkInt64SubOp.cpp
