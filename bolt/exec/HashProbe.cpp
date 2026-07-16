@@ -1364,6 +1364,11 @@ void HashProbe::prepareFilterRowsForNullAwareJoin(
 
 namespace {
 
+// Returns a bitset where set bits mean "filter passed" for a FLAT bool
+// vector: non-null ∧ true ≡ valueBits & nullBits (null polarity: kNotNull=1).
+// Returns nullptr when the result is not flat, or when nulls are present but
+// the VectorPtr is shared (cannot AND in place). Used by null-aware table
+// filter scan and by HashProbe::evalFilter Inner / LeftSemiFilter fast path.
 const uint64_t* getFlatFilterResult(VectorPtr& result) {
   if (!result->isFlatEncoding()) {
     return nullptr;
@@ -1561,9 +1566,43 @@ int32_t HashProbe::evalFilter(int32_t numRows) {
   EvalCtx evalCtx(operatorCtx_->execCtx(), filter_.get(), filterInput_.get());
   filter_->eval(0, 1, true, filterInputRows_, evalCtx, filterResult_);
 
+  int32_t numPassed = 0;
+
+  // Fast path (PR #54 / boostkit-velox style): when filterInputRows_ is fully
+  // selected and filterResult_ is flat bool, passed ≡ non-null ∧ true, which
+  // is nullBits & valueBits (see getFlatFilterResult). Only Inner-like and
+  // LeftSemiFilter are wired here; Left/Full (incl. range-partition) and
+  // Anti / LeftSemiProject keep the scalar paths below.
+  const bool tryFlatPassedCompact = filterInputRows_.isAllSelected() &&
+      (isLeftSemiFilterJoin(joinType_) ||
+       (!(isLeftJoin(joinType_) || isFullJoin(joinType_) ||
+          isLeftSemiProjectJoin(joinType_) || isAntiJoin(joinType_))));
+  if (tryFlatPassedCompact) {
+    if (auto* passedBits = getFlatFilterResult(filterResult_[0])) {
+      if (isLeftSemiFilterJoin(joinType_)) {
+        auto addLastMatch = [&](auto row) {
+          outputTableRows_[numPassed] = nullptr;
+          rawOutputProbeRowMapping[numPassed++] = row;
+        };
+        bits::forEachSetBit(passedBits, 0, numRows, [&](auto i) {
+          leftSemiFilterJoinTracker_.advance(
+              rawOutputProbeRowMapping[i], addLastMatch);
+        });
+        if (results_.atEnd()) {
+          leftSemiFilterJoinTracker_.finish(addLastMatch);
+        }
+        return numPassed;
+      }
+      bits::forEachSetBit(passedBits, 0, numRows, [&](auto i) {
+        outputTableRows_[numPassed] = outputTableRows_[i];
+        rawOutputProbeRowMapping[numPassed++] = rawOutputProbeRowMapping[i];
+      });
+      return numPassed;
+    }
+  }
+
   decodedFilterResult_.decode(*filterResult_[0], filterInputRows_);
 
-  int32_t numPassed = 0;
   if (isLeftJoin(joinType_) || isFullJoin(joinType_)) {
     if (probeRangePartition_) {
       if (includingMiss_) {
