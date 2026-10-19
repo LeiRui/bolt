@@ -845,7 +845,7 @@ class HashTable : public BaseHashTable {
   }
 
   /// Enables the SIMD probe/build path. The flag is only honored at runtime
-  /// when the CPU supports AVX2; see simdActive().
+  /// when the CPU supports AVX2 or 256-bit SVE; see simdActive().
   void setSimdEnabled(bool enabled) override;
 
   void setMayErase(bool mayErase) override {
@@ -867,10 +867,11 @@ class HashTable : public BaseHashTable {
   }
 
   /// True when SIMD paths should be used: the flag is on, the table is not in
-  /// hybrid mode and the CPU supports AVX2. Callers should branch on this
-  /// before invoking any SIMD-specific helper.
+  /// hybrid mode, and the CPU has AVX2 or 256-bit SVE. Callers should branch
+  /// on this before invoking any SIMD-specific helper.
   bool simdActive() const override {
-    return simdEnabled_ && hybridData_ == nullptr && process::hasAvx2();
+    return simdEnabled_ && hybridData_ == nullptr &&
+        process::hasSimdHashTableIsa();
   }
 
   /// True when the SIMD bucket NK layout is active for aggregation. Join probe

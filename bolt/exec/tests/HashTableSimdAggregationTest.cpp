@@ -59,8 +59,8 @@ void assertAggregationMatchesScalar(
 } // namespace
 
 TEST_F(HashTableSimdAggregationTest, varcharSingleKey) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // 8 input batches with a deliberately diverse VARCHAR key palette.
   auto palette = hashTableSimdVarcharValues();
@@ -89,8 +89,8 @@ TEST_F(HashTableSimdAggregationTest, varcharSingleKey) {
 }
 
 TEST_F(HashTableSimdAggregationTest, mixedKeyTypes) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // 3-key group-by mixing types: BIGINT + VARCHAR + DOUBLE.
   // Every dimension carries adversarial values:
@@ -166,8 +166,8 @@ TEST_F(HashTableSimdAggregationTest, mixedKeyTypes) {
 }
 
 TEST_F(HashTableSimdAggregationTest, distinct) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Distinct (group-by with no aggregates). VARCHAR with diverse sizes.
   std::vector<std::string> palette = {
@@ -201,8 +201,8 @@ TEST_F(HashTableSimdAggregationTest, distinct) {
 }
 
 TEST_F(HashTableSimdAggregationTest, manyBatchesForRehash) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Many small batches with steadily growing distinct keys (each batch
   // adds previously-unseen keys) to force multiple mid-stream rehashes
@@ -236,8 +236,8 @@ TEST_F(HashTableSimdAggregationTest, manyBatchesForRehash) {
 }
 
 TEST_F(HashTableSimdAggregationTest, nullKeyMix) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Heavy null pattern in keys: every 2nd row is null on key1, every
   // 3rd on key2. Tests the deselectRowsWithNulls path and SIMD probe
@@ -265,8 +265,8 @@ TEST_F(HashTableSimdAggregationTest, nullKeyMix) {
 }
 
 TEST_F(HashTableSimdAggregationTest, withSpill) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // SIMD + spill: aggregation builds a large hash table, then spills.
   // Verifies that SIMD layout is correctly serialized + deserialized
@@ -316,8 +316,8 @@ TEST_F(HashTableSimdAggregationTest, withSpill) {
 }
 
 TEST_F(HashTableSimdAggregationTest, encodedKeys) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Operator-level encoded input: dictionary + constant key columns.
   // HashTableTest covers VectorHasher encodings directly; this verifies
@@ -367,8 +367,8 @@ TEST_F(HashTableSimdAggregationTest, encodedKeys) {
 }
 
 TEST_F(HashTableSimdAggregationTest, emptyStringFromTpcdsPattern) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // TPC-DS time_dim.t_meal_time legitimately contains empty strings for
   // non-meal hours. This is a focused operator-level regression for the
@@ -406,8 +406,8 @@ TEST_F(HashTableSimdAggregationTest, emptyStringFromTpcdsPattern) {
 }
 
 TEST_F(HashTableSimdAggregationTest, forcedNormalizedKey) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Operator-level aggregation that naturally selects kNormalizedKey:
   // two finite BIGINT ranges whose product exceeds kArrayHashMaxSize, but

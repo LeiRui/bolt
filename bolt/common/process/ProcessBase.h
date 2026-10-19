@@ -74,6 +74,16 @@ uint64_t threadCpuNanos();
 // flag.
 bool hasAvx2();
 
+// True on Linux aarch64 when SVE is enabled and the vector length is 32 bytes
+// (256 bits). The check reads HWCAP before executing any SVE instruction.
+bool hasSve256();
+
+// True when the optional SIMD hash table in exec/HashTable can run: AVX2, or
+// 256-bit SVE. Other SVE widths stay off; those paths are fixed at 4x u64.
+inline bool hasSimdHashTableIsa() {
+  return hasAvx2() || hasSve256();
+}
+
 // True if the machine has Intel BMI2 instructions and these are not disabled by
 // flag.
 bool hasBmi2();

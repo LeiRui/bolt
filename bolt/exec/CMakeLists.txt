@@ -131,6 +131,24 @@ set_target_properties(
       ON
 )
 
+# 256-bit SVE bodies for the optional SIMD hash table. Kept out of the default
+# aarch64 TU so the rest of bolt_exec does not execute SVE instructions.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  target_sources(
+    bolt_exec
+    PRIVATE
+      HashTableSimdSve.cpp
+      HashTableSimdHashSve.cpp
+  )
+  set_source_files_properties(
+    HashTableSimdSve.cpp
+    HashTableSimdHashSve.cpp
+    PROPERTIES
+      COMPILE_OPTIONS
+        "-march=armv8-a+sve"
+  )
+endif()
+
 add_subdirectory(radixsort)
 
 if(${ENABLE_BOLT_JIT})

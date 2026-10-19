@@ -38,6 +38,13 @@
 #include <folly/CpuId.h>
 #include <folly/FileUtil.h>
 #include <folly/String.h>
+
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+#endif
 #include "bolt/common/flags/BoltFlags.h"
 
 constexpr const char* kProcSelfCmdline = "/proc/self/cmdline";
@@ -137,6 +144,26 @@ bool hasBmi2() {
 bool hasNeon() {
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
   return true;
+#else
+  return false;
+#endif
+}
+
+#if defined(__aarch64__) && defined(__linux__)
+uint64_t sveVectorLengthBytes();
+#endif
+
+bool hasSve256() {
+#if defined(__aarch64__) && defined(__linux__)
+  // HWCAP is read in this translation unit, which is not compiled with +sve.
+  // sveVectorLengthBytes() is the only call that executes an SVE instruction.
+  static const bool cached = []() {
+    if ((getauxval(AT_HWCAP) & HWCAP_SVE) == 0) {
+      return false;
+    }
+    return sveVectorLengthBytes() == 32;
+  }();
+  return cached;
 #else
   return false;
 #endif

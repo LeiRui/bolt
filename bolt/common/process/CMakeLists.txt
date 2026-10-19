@@ -30,6 +30,16 @@ bolt_add_library(
                TraceContext.cpp
 )
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  target_sources(bolt_process PRIVATE ProcessSve.cpp)
+  set_source_files_properties(
+    ProcessSve.cpp
+    PROPERTIES
+      COMPILE_OPTIONS
+        "-march=armv8-a+sve"
+  )
+endif()
+
 target_link_libraries(
   bolt_process
   PUBLIC

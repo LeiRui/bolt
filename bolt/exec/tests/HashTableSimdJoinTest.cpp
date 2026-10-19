@@ -67,8 +67,8 @@ class HashTableSimdJoinTest : public HiveConnectorTestBase {
 };
 
 TEST_F(HashTableSimdJoinTest, inner) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(2'000)};
   std::vector<RowVectorPtr> probeVectors;
@@ -90,8 +90,8 @@ TEST_F(HashTableSimdJoinTest, inner) {
 }
 
 TEST_F(HashTableSimdJoinTest, leftOuter) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'200)};
   std::vector<RowVectorPtr> probeVectors;
@@ -113,8 +113,8 @@ TEST_F(HashTableSimdJoinTest, leftOuter) {
 }
 
 TEST_F(HashTableSimdJoinTest, rightOuter) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(2'500)};
   std::vector<RowVectorPtr> probeVectors;
@@ -136,8 +136,8 @@ TEST_F(HashTableSimdJoinTest, rightOuter) {
 }
 
 TEST_F(HashTableSimdJoinTest, antiJoin) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(900)};
   std::vector<RowVectorPtr> probeVectors{makeVarcharProbeVector(1'500)};
@@ -156,8 +156,8 @@ TEST_F(HashTableSimdJoinTest, antiJoin) {
 }
 
 TEST_F(HashTableSimdJoinTest, leftSemiFilter) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'100)};
   std::vector<RowVectorPtr> probeVectors{makeVarcharProbeVector(1'300)};
@@ -176,8 +176,8 @@ TEST_F(HashTableSimdJoinTest, leftSemiFilter) {
 }
 
 TEST_F(HashTableSimdJoinTest, multiKeyMixedTypes) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Two-key join (BIGINT + VARCHAR). VARCHAR carries the adversarial
   // diversity. BIGINT covers extremes.
@@ -237,8 +237,8 @@ TEST_F(HashTableSimdJoinTest, multiKeyMixedTypes) {
 }
 
 TEST_F(HashTableSimdJoinTest, hotKeyHighDuplicateBuild) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   // Build side is dominated by one hot key (~2000 duplicates) plus a
   // smaller tail of unique keys; probe-side picks the hot key for ~50%
@@ -288,8 +288,8 @@ TEST_F(HashTableSimdJoinTest, hotKeyHighDuplicateBuild) {
 }
 
 TEST_F(HashTableSimdJoinTest, parallelBuild) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   SCOPED_TESTVALUE_SET(
       "bytedance::bolt::exec::HashTable::setHashMode",
@@ -354,8 +354,8 @@ TEST_F(HashTableSimdJoinTest, parallelBuild) {
 }
 
 TEST_F(HashTableSimdJoinTest, fullOuter) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'300)};
   std::vector<RowVectorPtr> probeVectors;
@@ -412,8 +412,8 @@ TEST_F(HashTableSimdJoinTest, fullOuterEmptyBuild) {
 }
 
 TEST_F(HashTableSimdJoinTest, leftSemiProject) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'000)};
   std::vector<RowVectorPtr> probeVectors{makeVarcharProbeVector(1'500)};
@@ -433,8 +433,8 @@ TEST_F(HashTableSimdJoinTest, leftSemiProject) {
 }
 
 TEST_F(HashTableSimdJoinTest, rightSemiFilter) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'600)};
   std::vector<RowVectorPtr> probeVectors;
@@ -457,8 +457,8 @@ TEST_F(HashTableSimdJoinTest, rightSemiFilter) {
 }
 
 TEST_F(HashTableSimdJoinTest, rightSemiProject) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeVarcharBuildVector(1'400)};
   std::vector<RowVectorPtr> probeVectors{makeVarcharProbeVector(1'100)};
@@ -478,8 +478,8 @@ TEST_F(HashTableSimdJoinTest, rightSemiProject) {
 }
 
 TEST_F(HashTableSimdJoinTest, nullAwareAntiJoinWithNulls) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   std::vector<RowVectorPtr> buildVectors{makeRowVector(
       {"u_k", "u_v"},
@@ -508,8 +508,8 @@ TEST_F(HashTableSimdJoinTest, nullAwareAntiJoinWithNulls) {
 }
 
 TEST_F(HashTableSimdJoinTest, encodedProbeAndBuildKeys) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   auto makeEncodedJoinInput = [&](const std::string& keyName,
                                   const std::string& constName,

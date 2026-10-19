@@ -151,5 +151,20 @@ FOLLY_ALWAYS_INLINE char* stripTag(char* tagged) {
       reinterpret_cast<uintptr_t>(tagged) & kPointerMask);
 }
 
+#if defined(__aarch64__)
+// Both halves of the 8-slot bucket are loaded. Bits [laneBegin, laneEnd) are
+// set where the slot is empty or its tag matches. Same bitmask as the AVX2
+// movemask path, so the caller still takes the first set bit with ctz.
+uint32_t sveBucketStopMask(
+    char* const* table,
+    uint64_t bucket,
+    uint64_t tag,
+    uint32_t laneBegin,
+    uint32_t laneEnd);
+
+// Four uint64 slots at a time: slot = (slot + 1) & mask, then a scalar tail.
+void sveAdvanceSlots(uint64_t* activeSlots, int numSlots, uint64_t mask);
+#endif
+
 } // namespace hash_table_simd
 } // namespace bytedance::bolt::exec

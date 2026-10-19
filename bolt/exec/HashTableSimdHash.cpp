@@ -1299,7 +1299,8 @@ bool tryRehash(
   }
 }
 
-#else
+#elif !defined(__aarch64__)
+// aarch64 definitions are in HashTableSimdHashSve.cpp.
 
 bool tryHash(
     VectorHasher& /*hasher*/,

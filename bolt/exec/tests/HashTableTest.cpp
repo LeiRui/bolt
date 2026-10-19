@@ -907,8 +907,8 @@ TEST_P(HashTableTest, simdDisabledForHybridJoin) {
   };
 
   auto table = makeTable(false);
-  EXPECT_EQ(table->simdActive(), process::hasAvx2());
-  EXPECT_EQ(table->simdHashLayoutActive(), process::hasAvx2());
+  EXPECT_EQ(table->simdActive(), process::hasSimdHashTableIsa());
+  EXPECT_EQ(table->simdHashLayoutActive(), process::hasSimdHashTableIsa());
 
   auto hybridTable = makeTable(true);
   ASSERT_TRUE(hybridTable->simdEnabled());
@@ -918,8 +918,8 @@ TEST_P(HashTableTest, simdDisabledForHybridJoin) {
 }
 
 TEST_P(HashTableTest, simdNormalizedKeyLayoutOnlyForAggregation) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
 
   std::vector<std::unique_ptr<VectorHasher>> joinHashers;
@@ -955,8 +955,8 @@ TEST_P(HashTableTest, simdNormalizedKeyLayoutOnlyForAggregation) {
 }
 
 TEST_P(HashTableTest, simdConsistencyWithDuplicateJoinKeys) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
 
   std::vector<std::unique_ptr<VectorHasher>> hashers;
@@ -1045,8 +1045,8 @@ TEST_P(HashTableTest, simdConsistencyWithDuplicateJoinKeys) {
 }
 
 TEST_P(HashTableTest, simdKeyColumnsUseNullMask) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
 
   std::vector<std::unique_ptr<VectorHasher>> hashers;
@@ -1108,8 +1108,8 @@ TEST_P(HashTableTest, simdKeyColumnsUseNullMask) {
 }
 
 TEST_P(HashTableTest, simdProbeCandidateCompaction) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
 
   std::vector<std::unique_ptr<VectorHasher>> hashers;
@@ -1194,8 +1194,8 @@ TEST_P(HashTableTest, simdProbeCandidateCompaction) {
 }
 
 TEST_P(HashTableTest, simdAggregationCollisionAndRehash) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
 
   using Key = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
@@ -1313,8 +1313,8 @@ TEST_P(HashTableTest, simdAggregationCollisionAndRehash) {
 }
 
 TEST_P(HashTableTest, simdSkewedParallelBuildOverflow) {
-  if (!process::hasAvx2()) {
-    GTEST_SKIP() << "SIMD requires AVX2";
+  if (!process::hasSimdHashTableIsa()) {
+    GTEST_SKIP() << "SIMD hash table requires AVX2 or 256-bit SVE";
   }
   constexpr int32_t kRows = 4096;
   std::vector<int64_t> keys;

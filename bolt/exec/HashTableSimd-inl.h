@@ -57,6 +57,9 @@ scanBucketLowLanes(
       (_mm256_movemask_pd(_mm256_castsi256_pd(stopVec1)) << 4);
   const uint32_t cursorMask = (static_cast<uint32_t>(1) << laneEnd) - 1;
   const uint32_t stops = stopMask & cursorMask;
+#elif defined(__aarch64__)
+  const uint32_t stops = sveBucketStopMask(
+      table, bucket, tag, 0, static_cast<uint32_t>(laneEnd));
 #else
   uint32_t stops = 0;
   for (uint64_t lane = 0; lane < laneEnd; ++lane) {
@@ -135,9 +138,13 @@ compactNormalizedKeyMismatches(
 #else
 inline void
 advanceSlots(uint64_t* __restrict__ activeSlots, int numSlots, uint64_t mask) {
+#if defined(__aarch64__)
+  sveAdvanceSlots(activeSlots, numSlots, mask);
+#else
   for (int i = 0; i < numSlots; ++i) {
     activeSlots[i] = (activeSlots[i] + 1) & mask;
   }
+#endif
 }
 
 inline int compactNormalizedKeyMismatches(
@@ -238,6 +245,13 @@ scanBucketChain(
     const uint32_t cursorMask =
         (static_cast<uint32_t>(0xFF) << startLane) & 0xFF;
     const uint32_t stops = stopMask & cursorMask;
+#elif defined(__aarch64__)
+    const uint32_t stops = sveBucketStopMask(
+        table,
+        bucket,
+        tag,
+        static_cast<uint32_t>(startLane),
+        static_cast<uint32_t>(kBucketSize));
 #else
     uint32_t stops = 0;
     for (uint64_t lane = startLane; lane < kBucketSize; ++lane) {
@@ -313,6 +327,13 @@ scanBucketChainInRange(
     const uint32_t cursorMask =
         (static_cast<uint32_t>(0xFF) << startLane) & 0xFF;
     const uint32_t stops = stopMask & cursorMask;
+#elif defined(__aarch64__)
+    const uint32_t stops = sveBucketStopMask(
+        table,
+        bucket,
+        tag,
+        static_cast<uint32_t>(startLane),
+        static_cast<uint32_t>(kBucketSize));
 #else
     uint32_t stops = 0;
     for (uint64_t lane = startLane; lane < kBucketSize; ++lane) {
