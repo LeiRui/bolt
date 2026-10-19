@@ -119,7 +119,11 @@ TEST_F(QueryConfigTest, parquetRepDefStreamingWindowSize) {
 TEST_F(QueryConfigTest, simdHashTableEnabled) {
   {
     auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
+#if defined(__aarch64__)
+    EXPECT_TRUE(queryCtx->queryConfig().simdHashTableEnabled());
+#else
     EXPECT_FALSE(queryCtx->queryConfig().simdHashTableEnabled());
+#endif
   }
 
   {

@@ -500,7 +500,9 @@ class QueryConfig {
 
   /// If true, enable SIMD-specialized hash table paths for the main
   /// HashAggregation and HashJoin hash tables. Other hash table users keep the
-  /// scalar default unless they explicitly opt in.
+  /// scalar default unless they explicitly opt in. An unset value defaults to
+  /// false on x86 and true on aarch64. Runtime use still requires AVX2 or
+  /// 256-bit SVE; see HashTable::simdActive().
   static constexpr const char* kSimdHashTableEnabled =
       "simd_hash_table_enabled";
 
@@ -1544,7 +1546,13 @@ class QueryConfig {
   }
 
   bool simdHashTableEnabled() const {
+    // aarch64 defaults on. simdActive() still requires 256-bit SVE, so a
+    // shorter vector length keeps the scalar table.
+#if defined(__aarch64__)
+    return get<bool>(kSimdHashTableEnabled, true);
+#else
     return get<bool>(kSimdHashTableEnabled, false);
+#endif
   }
 
   bool isExchangeCompressionEnabled() const {
