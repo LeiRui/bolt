@@ -295,7 +295,25 @@ inline void clipTrailingStores(
   }
 }
 
-template <typename T>
+template <bool kFastPayload, uint64_t kMask>
+FOLLY_ALWAYS_INLINE uint64_t extractVarintPayload(uint64_t word) {
+#if defined(__aarch64__)
+  if constexpr (kFastPayload) {
+    constexpr int kShift = __builtin_ctzll(kMask);
+    constexpr uint64_t kPayloadMask = kMask >> kShift;
+    static_assert(kPayloadMask == 0x7f7fULL || kPayloadMask == 0x7f7f7fULL);
+    const uint64_t value = word >> kShift;
+    uint64_t result = (value & 0x7fULL) | ((value >> 1) & 0x3f80ULL);
+    if constexpr (kPayloadMask == 0x7f7f7fULL) {
+      result |= (value >> 2) & 0x1fc000ULL;
+    }
+    return result;
+  }
+#endif
+  return bits::extractBits<uint64_t>(word, kMask);
+}
+
+template <typename T, bool kFastPayload = false>
 FOLLY_ALWAYS_INLINE void varintSwitch(
     uint64_t word,
     uint64_t controlBits,
@@ -315,7 +333,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 1ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       unpack4x1(word >> 16, output);
       carryover = 0ULL;
@@ -326,7 +344,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
       unpack4x1(word >> 24, output);
       clipTrailingStores(3, controlBits, pos, output);
       carryover = 0ULL;
@@ -335,7 +353,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 3ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       unpack4x1(word >> 24, output);
       clipTrailingStores(3, controlBits, pos, output);
@@ -348,7 +366,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
       unpack4x1(word >> 32, output);
       clipTrailingStores(4, controlBits, pos, output);
       carryover = 0ULL;
@@ -357,9 +375,9 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 5ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
       unpack4x1(word >> 32, output);
       clipTrailingStores(4, controlBits, pos, output);
       carryover = 0ULL;
@@ -370,7 +388,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f7f00ULL>(word);
       unpack4x1(word >> 32, output);
       clipTrailingStores(4, controlBits, pos, output);
       carryover = 0ULL;
@@ -393,7 +411,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -401,10 +419,10 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 9ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -414,8 +432,8 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -423,9 +441,9 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 11ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -436,7 +454,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f7f0000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -444,9 +462,9 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 13ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f7f0000ULL>(word);
       *output++ = ((word >> 40) & 0x7f);
       carryover = 0ULL;
       carryoverBits = 0;
@@ -474,18 +492,18 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     case 16ULL: {
       unpack4x1(word >> 0, output);
       applyCarryover(carryoverBits, carryover, output - 4);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
     }
     case 17ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
       *output++ = ((word >> 24) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -494,19 +512,19 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
       *output++ = ((word >> 24) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
     }
     case 19ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 24) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -516,18 +534,18 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
     }
     case 21ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -536,8 +554,8 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f7f00ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -546,7 +564,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           bits::extractBits<uint64_t>(word, 0x000000007f7f7f7fULL);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -557,17 +575,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
     }
     case 25ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -576,17 +594,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
     }
     case 27ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryover = 0ULL;
       carryoverBits = 0;
       break;
@@ -603,7 +621,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 29ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = bits::extractBits<uint64_t>(word, 0x00007f7f7f7f0000ULL);
       carryover = 0ULL;
@@ -637,7 +655,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 33ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
       *output++ = ((word >> 24) & 0x7f);
@@ -650,7 +668,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
       *output++ = ((word >> 24) & 0x7f);
       *output++ = ((word >> 32) & 0x7f);
       carryover = ((word >> 40) & 0x7f);
@@ -659,7 +677,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 35ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 24) & 0x7f);
       *output++ = ((word >> 32) & 0x7f);
@@ -672,7 +690,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
       *output++ = ((word >> 32) & 0x7f);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
@@ -680,9 +698,9 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 37ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
       *output++ = ((word >> 32) & 0x7f);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
@@ -692,7 +710,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f7f00ULL>(word);
       *output++ = ((word >> 32) & 0x7f);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
@@ -713,17 +731,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
     }
     case 41ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
@@ -732,17 +750,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
     }
     case 43ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f000000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
@@ -752,16 +770,16 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f7f0000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
     }
     case 45ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x0000007f7f7f0000ULL>(word);
       carryover = ((word >> 40) & 0x7f);
       carryoverBits = 7;
       break;
@@ -786,17 +804,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     case 48ULL: {
       unpack4x1(word >> 0, output);
       applyCarryover(carryoverBits, carryover, output - 4);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
     case 49ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
       *output++ = ((word >> 24) & 0x7f);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
@@ -804,18 +822,18 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
       *output++ = ((word >> 24) & 0x7f);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
     case 51ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 24) & 0x7f);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
@@ -824,17 +842,17 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
     case 53ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f0000ULL>(word);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
@@ -842,8 +860,8 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x000000007f7f7f00ULL>(word);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
@@ -851,7 +869,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           bits::extractBits<uint64_t>(word, 0x000000007f7f7f7fULL);
       *output++ = (firstValue << carryoverBits) | carryover;
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f00000000ULL>(word);
       carryoverBits = 14;
       break;
     }
@@ -861,16 +879,16 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 8) & 0x7f);
       *output++ = ((word >> 16) & 0x7f);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryoverBits = 21;
       break;
     }
     case 57ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       *output++ = ((word >> 16) & 0x7f);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryoverBits = 21;
       break;
     }
@@ -878,16 +896,16 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
       const uint64_t firstValue =
           static_cast<uint64_t>(static_cast<uint8_t>(word));
       *output++ = (firstValue << carryoverBits) | carryover;
-      *output++ = bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      *output++ = extractVarintPayload<kFastPayload, 0x00000000007f7f00ULL>(word);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryoverBits = 21;
       break;
     }
     case 59ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+          extractVarintPayload<kFastPayload, 0x00000000007f7f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
-      carryover = bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+      carryover = extractVarintPayload<kFastPayload, 0x00007f7f7f000000ULL>(word);
       carryoverBits = 21;
       break;
     }
@@ -902,7 +920,7 @@ FOLLY_ALWAYS_INLINE void varintSwitch(
     }
     case 61ULL: {
       const uint64_t firstValue =
-          bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+          extractVarintPayload<kFastPayload, 0x0000000000007f7fULL>(word);
       *output++ = (firstValue << carryoverBits) | carryover;
       carryover = bits::extractBits<uint64_t>(word, 0x00007f7f7f7f0000ULL);
       carryoverBits = 28;
@@ -1013,7 +1031,13 @@ void IntDecoder<isSigned>::bulkReadRows(
         pos += 8 - maskSize;
         continue;
       }
+#if defined(__aarch64__)
+      // Pack the eight byte continuation bits in the same order as extractBits.
+      const uint64_t flags = (word >> 7) & 0x0101010101010101ULL;
+      const uint64_t controlBits = (flags * 0x0102040810204080ULL) >> 56;
+#else
       const uint64_t controlBits = bits::extractBits<uint64_t>(word, mask);
+#endif
       int32_t numEnds = __builtin_popcount(controlBits ^ 0xff);
       if (row != nextRow) {
         if (nextRow > row + numEnds) {
@@ -1027,7 +1051,7 @@ void IntDecoder<isSigned>::bulkReadRows(
         // A word worth of contiguous rows.
         auto orgOutput = output;
         // Reading 6 - 8 bytes of contiguous values.
-        varintSwitch(word, controlBits, pos, output, carryover, carryoverBits);
+        varintSwitch<T, true>(word, controlBits, pos, output, carryover, carryoverBits);
         int numDone = output - orgOutput;
         row += numDone;
         nextRowIndex += numDone;
@@ -1066,7 +1090,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 1ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1097,7 +1121,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 24) & 0x7f);
@@ -1115,7 +1139,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 3ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1146,7 +1170,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1161,14 +1185,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 5ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1190,7 +1214,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+                  extractVarintPayload<true, 0x000000007f7f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1236,7 +1260,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1248,7 +1272,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 9ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1258,7 +1282,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1277,11 +1301,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1293,14 +1317,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 11ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1322,7 +1346,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+                  extractVarintPayload<true, 0x0000007f7f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1334,14 +1358,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 13ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+                  extractVarintPayload<true, 0x0000007f7f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 40) & 0x7f);
@@ -1403,7 +1427,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1412,7 +1436,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 17ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1425,7 +1449,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1441,14 +1465,14 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 24) & 0x7f);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1457,7 +1481,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 19ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1467,7 +1491,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1486,11 +1510,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1499,18 +1523,18 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 21ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1526,11 +1550,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+                  extractVarintPayload<true, 0x000000007f7f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1546,7 +1570,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1568,7 +1592,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1577,7 +1601,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 25ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1587,7 +1611,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1603,11 +1627,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1616,14 +1640,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 27ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
             }
             carryover = 0ULL;
             carryoverBits = 0;
@@ -1651,7 +1675,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 29ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1721,7 +1745,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 33ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1751,7 +1775,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 24) & 0x7f);
@@ -1768,7 +1792,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 35ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1798,7 +1822,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1812,14 +1836,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 37ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1840,7 +1864,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+                  extractVarintPayload<true, 0x000000007f7f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 32) & 0x7f);
@@ -1884,7 +1908,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -1895,7 +1919,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 41ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -1905,7 +1929,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -1923,11 +1947,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -1938,14 +1962,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 43ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f000000ULL);
+                  extractVarintPayload<true, 0x0000007f7f000000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -1966,7 +1990,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+                  extractVarintPayload<true, 0x0000007f7f7f0000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -1977,14 +2001,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 45ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x0000007f7f7f0000ULL);
+                  extractVarintPayload<true, 0x0000007f7f7f0000ULL>(word);
             }
             if (row == nextRow) {
               carryover = ((word >> 40) & 0x7f);
@@ -2043,7 +2067,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2051,7 +2075,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 49ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -2064,7 +2088,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2079,14 +2103,14 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ = ((word >> 24) & 0x7f);
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2094,7 +2118,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 51ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -2104,7 +2128,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2122,11 +2146,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2134,18 +2158,18 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 53ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f0000ULL);
+                  extractVarintPayload<true, 0x000000007f7f0000ULL>(word);
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2160,11 +2184,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x000000007f7f7f00ULL);
+                  extractVarintPayload<true, 0x000000007f7f7f00ULL>(word);
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2179,7 +2203,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f00000000ULL);
+                  extractVarintPayload<true, 0x00007f7f00000000ULL>(word);
               carryoverBits = 14;
             }
             break;
@@ -2200,7 +2224,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
               carryoverBits = 21;
             }
             break;
@@ -2208,7 +2232,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 57ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
@@ -2218,7 +2242,7 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
               carryoverBits = 21;
             }
             break;
@@ -2233,11 +2257,11 @@ void IntDecoder<isSigned>::bulkReadRows(
             }
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               *output++ =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f00ULL);
+                  extractVarintPayload<true, 0x00000000007f7f00ULL>(word);
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
               carryoverBits = 21;
             }
             break;
@@ -2245,14 +2269,14 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 59ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x00000000007f7f7fULL);
+                  extractVarintPayload<true, 0x00000000007f7f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
             }
             if (row == nextRow) {
               carryover =
-                  bits::extractBits<uint64_t>(word, 0x00007f7f7f000000ULL);
+                  extractVarintPayload<true, 0x00007f7f7f000000ULL>(word);
               carryoverBits = 21;
             }
             break;
@@ -2278,7 +2302,7 @@ void IntDecoder<isSigned>::bulkReadRows(
           case 61ULL: {
             if (isEnabled(row, nextRow, nextRowIndex, rows.data())) {
               const uint64_t firstValue =
-                  bits::extractBits<uint64_t>(word, 0x0000000000007f7fULL);
+                  extractVarintPayload<true, 0x0000000000007f7fULL>(word);
               *output++ = (firstValue << carryoverBits) | carryover;
               carryover = 0;
               carryoverBits = 0;
