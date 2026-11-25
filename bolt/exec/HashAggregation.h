@@ -30,8 +30,10 @@
 
 #pragma once
 
-#include "bolt/exec/GroupingSet.h"
+#include "bolt/exec/DebugStat.h"
+#include "bolt/exec/GroupAggregation.h"
 #include "bolt/exec/Operator.h"
+
 namespace bytedance::bolt::exec {
 
 class HashAggregation : public Operator {
@@ -44,6 +46,12 @@ class HashAggregation : public Operator {
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::AggregationNode>& aggregationNode);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashAggregation() override {
+    debugStat_.print();
+  }
+#endif
 
   void initialize() override;
 
@@ -128,7 +136,7 @@ class HashAggregation : public Operator {
   const volatile int32_t partialAggregationSpillMaxPct_;
 
   int64_t maxPartialAggregationMemoryUsage_;
-  std::unique_ptr<GroupingSet> groupingSet_;
+  std::unique_ptr<GroupAggregation> groupingSet_;
 
   // Size of a single output row estimated using
   // 'groupingSet_->estimateRowSize()'. If spilling, this value is set to max
@@ -154,8 +162,8 @@ class HashAggregation : public Operator {
   // Count the number of input rows. It is reset on partial aggregation output
   // flush.
   int64_t numInputRows_ = 0;
-  // Count the number of output rows. It is reset on partial aggregation output
-  // flush.
+  // Count the number of output rows. It is reset on partial aggregation
+  // output flush.
   int64_t numOutputRows_ = 0;
 
   int64_t maxInputBatchCount_ = 0;
@@ -175,6 +183,7 @@ class HashAggregation : public Operator {
   bool supportRowBasedOutput_{false};
   std::vector<AggregateInfo> aggregatesForExtractColumns_;
   RowVectorPtr convertedInput_{nullptr};
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashAggregation)
 };
 
 } // namespace bytedance::bolt::exec

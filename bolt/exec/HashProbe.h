@@ -46,6 +46,12 @@ class HashProbe : public Operator {
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::HashJoinNode>& hashJoinNode);
 
+#ifdef DEBUG_STAT_ENABLED
+  ~HashProbe() override {
+    debugStat_.print();
+  }
+#endif
+
   void initialize() override;
 
   bool needsInput() const override {
@@ -671,6 +677,7 @@ class HashProbe : public Operator {
   RowTypePtr matchFlagType_{nullptr};
   RowVectorPtr accumulatedMatchFlag_{nullptr};
   RowVectorPtr tmpMatchFlagForFilter_{nullptr};
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashProbe)
 };
 
 inline std::ostream& operator<<(std::ostream& os, ProbeOperatorState state) {

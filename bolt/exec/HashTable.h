@@ -30,16 +30,34 @@
 
 #pragma once
 
-#include <vector/TypeAliases.h>
+#include <folly/CPortability.h>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/common/base/Portability.h"
 #include "bolt/common/base/RuntimeMetrics.h"
 #include "bolt/common/process/ProcessBase.h"
+#include "bolt/common/memory/Allocation.h"
+#include "bolt/common/memory/RawVector.h"
+#include "bolt/exec/AggregateInfo.h"
+#include "bolt/exec/DebugStat.h"
 #include "bolt/exec/HashTableSimd.h"
 #include "bolt/exec/OneWayStatusFlag.h"
 #include "bolt/exec/RowContainer.h"
+#include "bolt/exec/TaperHashTableWrapper.h"
 #include "bolt/exec/VectorHasher.h"
+#include "bolt/vector/DecodedVector.h"
+#include "bolt/vector/SelectivityVector.h"
+#include "bolt/vector/TypeAliases.h"
+
+#if defined(__aarch64__)
+#define BOLT_JOIN_ENABLE_TAPER true
+#else
+#define BOLT_JOIN_ENABLE_TAPER false
+#endif
+
 namespace bytedance {
 namespace bolt {
 namespace exec {
@@ -181,7 +199,13 @@ class BaseHashTable {
   static constexpr uint64_t kArrayHashMaxSize = 2L << 20;
 
   /// Specifies the hash mode of a table.
-  enum class HashMode { kHash, kArray, kNormalizedKey };
+  enum class HashMode {
+    kHash,
+    kArray,
+    kNormalizedKey,
+    kTaperHash,
+    kTaperFlat
+  };
 
   static constexpr int8_t kNoSpillInputStartPartitionBit = -1;
 
@@ -252,6 +276,20 @@ class BaseHashTable {
   /// returned in 'lookup.hits'.
   virtual void groupProbe(HashLookup& lookup) = 0;
 
+  /// Fuse aggregate into group probe iteration to prevent additional cache
+  /// load, only available in taper flat mode for now.
+  virtual void groupProbe(
+      HashLookup& lookup,
+      AggregateInfo& aggregate,
+      const std::vector<VectorPtr>& aggVectors,
+      const SelectivityVector& aggRows,
+      bool isRawInput) = 0;
+
+  // Check Aggregate function is supported in flat mode or not. if supported,
+  // groupProbe with aggregate is available to fuse aggregate into group probe
+  // iterations.
+  static bool isFlatCompatibleAggregate(Aggregate* function);
+
   /// Returns the first hit for each key in 'lookup'. The keys are in
   /// 'lookup.hits' with a nullptr representing a miss. This is for use in hash
   /// join probe. Use listJoinResults to iterate over the results.
@@ -265,7 +303,7 @@ class BaseHashTable {
   /// to remove entries with null grouping keys. Otherwise, assumes the caller
   /// has done that already. After this call, 'rows' may have no entries
   /// selected.
-  void prepareForJoinProbe(
+  virtual void prepareForJoinProbe(
       HashLookup& lookup,
       const RowVectorPtr& input,
       SelectivityVector& rows,
@@ -345,6 +383,17 @@ class BaseHashTable {
   /// 'freeTable' is true, for example after spilling all rows.
   virtual void clear(bool freeTable = false) = 0;
 
+  /// Clears the taper hash table.
+  virtual void clearTaperTable() {}
+
+  /// Sets whether taper mode is enabled.
+  virtual void setTaperEnabled(bool enable) {}
+
+  /// Returns whether taper mode is enabled.
+  virtual bool isTaperEnabled() const {
+    return false;
+  }
+
   /// Returns the capacity of the internal hash table which is number of rows
   /// it can stores in a group by or hash join build.
   virtual uint64_t capacity() const = 0;
@@ -374,6 +423,21 @@ class BaseHashTable {
   /// the hash numbers using the appropriate method of the
   /// VectorHashers of 'this'.
   virtual HashMode hashMode() const = 0;
+
+  /// Returns true if the hash mode is generic.
+  static FOLLY_ALWAYS_INLINE bool isGenericHashMode(HashMode mode) {
+    return mode != HashMode::kArray && mode != HashMode::kNormalizedKey;
+  }
+
+  /// Returns true if the hash mode is a taper hash mode.
+  static FOLLY_ALWAYS_INLINE bool isTaperMode(HashMode mode) {
+    return mode == HashMode::kTaperHash || mode == HashMode::kTaperFlat;
+  }
+
+  /// Returns true if the hash mode is taper flat mode.
+  static FOLLY_ALWAYS_INLINE bool isTaperFlatMode(HashMode mode) {
+    return mode == HashMode::kTaperFlat;
+  }
 
   /// Disables use of array or normalized key hash modes.
   void forceGenericHashMode() {
@@ -429,6 +493,7 @@ class BaseHashTable {
   HybridContainer* hybridData() const {
     return hybridData_.get();
   }
+  virtual TaperFlatHashTableWrapper::FlatRowContainer* flatRows() = 0;
 
   /// Returns all the row containers of a composed hash table such as for hash
   /// join use.
@@ -537,6 +602,9 @@ template <bool ignoreNullKeys>
 class HashTableTestHelper;
 }
 
+template <bool ignoreNullKeys>
+class HashTable;
+
 class ProbeState {
  public:
   enum class Operation { kProbe, kInsert, kErase };
@@ -546,6 +614,31 @@ class ProbeState {
   static constexpr int32_t kFullMask = 0xffff;
 
   int32_t row() const;
+
+  // --- Public accessors for state manipulation ---
+
+  char* group() const { return group_; }
+  void setGroup(char* g) { group_ = g; }
+
+  int64_t bucketOffset() const { return bucketOffset_; }
+  void setBucketOffset(int64_t o) { bucketOffset_ = o; }
+
+  BaseHashTable::TagVector wantedTags() const { return wantedTags_; }
+  void setWantedTags(BaseHashTable::TagVector t) { wantedTags_ = t; }
+
+  BaseHashTable::TagVector tagsInTable() const { return tagsInTable_; }
+  void setTagsInTable(BaseHashTable::TagVector t) { tagsInTable_ = t; }
+
+  BaseHashTable::MaskType hits() const { return hits_; }
+  void setHits(BaseHashTable::MaskType h) { hits_ = h; }
+
+  int32_t rowIndex() const { return row_; }
+  void setRowIndex(int32_t r) { row_ = r; }
+
+  uint8_t indexInTags() const { return indexInTags_; }
+  void setIndexInTags(uint8_t i) { indexInTags_ = i; }
+
+  static constexpr uint8_t kNotSet = 0xff;
 
   template <typename Table>
   inline void preProbe(const Table& table, uint64_t hash, int32_t row);
@@ -568,12 +661,10 @@ class ProbeState {
       const Table& table,
       const uint64_t* keys);
 
- private:
-  static constexpr uint8_t kNotSet = 0xff;
-
   template <Operation op, typename Table>
   inline void loadNextHit(Table& table, int32_t firstKey);
 
+ private:
   template <typename Table>
   void eraseHit(Table& table, int64_t& numTombstones);
 
@@ -609,7 +700,9 @@ class HashTable : public BaseHashTable {
       const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
       bool enableJitRowEqVectors,
       bool useMonotonicStringAllocation = false,
-      bool hybridMode = false);
+      bool hybridMode = false,
+      bool enableTaper = false,
+      bool enableFlatTaper = false);
 
   HashTable(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -624,7 +717,9 @@ class HashTable : public BaseHashTable {
       const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
       bool enableJitRowEqVectors,
       bool useMonotonicStringAllocation = false,
-      bool hybridMode = false);
+      bool hybridMode = false,
+      bool enableTaper = false,
+      bool enableFlatTaper = false);
 
   ~HashTable() override = default;
 
@@ -635,7 +730,9 @@ class HashTable : public BaseHashTable {
       const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
       bool jitRowEqVectors,
       bool useMonotonicStringAllocation = false,
-      bool simdEnabled = false) {
+      bool simdEnabled = false,
+      bool enableTaper = false,
+      bool enableFlatTaper = false) {
     auto table = std::make_unique<HashTable>(
         std::move(hashers),
         accumulators,
@@ -647,7 +744,10 @@ class HashTable : public BaseHashTable {
         pool,
         stringArena,
         jitRowEqVectors,
-        useMonotonicStringAllocation);
+        useMonotonicStringAllocation,
+        false, // hybridMode
+        enableTaper && !(simdEnabled && process::hasAvx2()),
+        enableFlatTaper);
     table->setSimdEnabled(simdEnabled);
     return table;
   }
@@ -677,12 +777,21 @@ class HashTable : public BaseHashTable {
         nullptr,
         jitRowEqVectors,
         useMonoAlloc /*useMonotonicStringAllocation*/,
-        hybridMode);
+        hybridMode,
+        BOLT_JOIN_ENABLE_TAPER && !hybridMode && !(simdEnabled && process::hasAvx2()),
+        false); // enableFlatTaper
     table->setSimdEnabled(simdEnabled);
     return table;
   }
 
   void groupProbe(HashLookup& lookup) override;
+
+  void groupProbe(
+      HashLookup& lookup,
+      AggregateInfo& aggregate,
+      const std::vector<VectorPtr>& aggVectors,
+      const SelectivityVector& aggRows,
+      bool isRawInput) override;
 
   void joinProbe(HashLookup& lookup) override;
 
@@ -730,6 +839,13 @@ class HashTable : public BaseHashTable {
     return table_;
   }
 
+  void clearTaperTable() override {
+    if (taperTableWrapper_.initialized()) {
+      taperTableWrapper_.clear();
+      taperTableWrapper_.reset();
+    }
+  }
+
   void directAddRows(
       HashLookup& lookup,
       const RowVectorPtr& input,
@@ -739,6 +855,9 @@ class HashTable : public BaseHashTable {
   int64_t allocatedBytes() const override {
     // For each row: sizeof(char*) per table entry + memory
     // allocated with MemoryAllocator for fixed-width rows and strings.
+    if (isTaperMode(hashMode_)) {
+      return taperTableWrapper_.allocatedBytes() + rows_->allocatedBytes();
+    }
     return sizeof(char*) * capacity_ + rows_->allocatedBytes();
   }
 
@@ -747,6 +866,9 @@ class HashTable : public BaseHashTable {
   }
 
   uint64_t capacity() const override {
+    if (isTaperMode(hashMode_)) {
+      return taperTableWrapper_.capacity();
+    }
     return capacity_;
   }
 
@@ -759,6 +881,13 @@ class HashTable : public BaseHashTable {
   }
 
   HashTableStats stats() const override {
+    if (isTaperMode(hashMode_)) {
+      return HashTableStats{
+          static_cast<int64_t>(taperTableWrapper_.capacity()),
+          0,
+          static_cast<int64_t>(taperTableWrapper_.size()),
+          0};
+    }
     return HashTableStats{
         capacity_, numRehashes_, numDistinct_, numTombstones_};
   }
@@ -798,6 +927,9 @@ class HashTable : public BaseHashTable {
           kNoSpillInputStartPartitionBit) override;
 
   uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override {
+    if (isTaperMode(hashMode_)) {
+      return taperTableWrapper_.hashTableSizeIncrease(numNewDistinct);
+    }
     const auto newNumDistinct = numDistinct_ + numNewDistinct;
     if (simdLayoutActive()) {
       if (newNumDistinct > simdRehashThreshold(capacity_)) {
@@ -816,6 +948,9 @@ class HashTable : public BaseHashTable {
   }
 
   uint64_t estimateHashTableSize(uint64_t numDistinct) const override {
+    if (isTaperMode(hashMode_)) {
+      return taperTableWrapper_.estimateHashTableSize(numDistinct);
+    }
     // Take the max of max size in array mode and estimated size in non-array
     // mode.
     const uint64_t maxByteSizeInArrayMode = kArrayHashMaxSize * tableSlotSize();
@@ -827,6 +962,9 @@ class HashTable : public BaseHashTable {
   }
 
   uint64_t rehashSize() const {
+    if (isTaperMode(hashMode_)) {
+      return taperTableWrapper_.expandThreshold();
+    }
     return rehashSize(capacity_ - numTombstones_);
   }
 
@@ -1083,6 +1221,21 @@ class HashTable : public BaseHashTable {
       raw_vector<uint64_t>& hashes,
       bool initNormalizedKeys);
 
+  void insertTaperKeyGroup(
+      char** groups,
+      int32_t numGroups,
+      raw_vector<uint64_t>& hashes);
+
+  void insertTaperFlatGroup(char** groups, int32_t numGroups);
+
+  void insertForJoinInTaperKey(
+      char** groups,
+      uint64_t* hashes,
+      int32_t numGroups,
+      TableInsertPartitionInfo* partitionInfo);
+
+  TaperFlatHashTableWrapper::FlatRowContainer* flatRows() override;
+
   /// Inserts 'numGroups' entries into 'this'. 'groups' point to contents in a
   /// RowContainer owned by 'this'. 'hashes' are the hash numbers or array
   /// indices (if kArray mode) for each group. Duplicate key rows are chained
@@ -1170,6 +1323,47 @@ class HashTable : public BaseHashTable {
   // SIMD bucket-layout variant for group by with normalized keys.
   void groupNormalizedKeyProbeSimd(HashLookup& lookup);
 
+  void groupTaperKeyProbe(HashLookup& lookup);
+
+  template <typename AggregateClass>
+  void groupTaperFlatProbe(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  template <DVecLayout KeyLayout, typename AggregateClass>
+  void groupTaperFlatProbe(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  template <DVecLayout KeyLayout, DVecLayout AggLayout, typename AggregateClass>
+  void groupTaperFlatProbe(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  template <DVecLayout AggLayout, typename AggregateClass>
+  void groupTaperFlatProbeConstKey(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  template <DVecLayout KeyLayout, typename AggregateClass>
+  void groupTaperFlatProbeConstAgg(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  template <typename AggregateClass>
+  void groupTaperFlatProbeConstKeyConstAgg(
+      HashLookup& lookup,
+      AggregateClass& aggregate,
+      DecodedVector& aggVector);
+
+  // Taper join probe
+  void joinTaperKeyProbe(HashLookup& lookup);
+
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
 
@@ -1225,7 +1419,7 @@ class HashTable : public BaseHashTable {
   // Finishes inserting an entry into a join hash table. If the insert
   // would fall outside of 'partitionBegin' ... 'partitionEnd', the
   // insert is not made but the row is instead added to 'overflow'.
-  template <bool isNormailizedKeyMode>
+  template <bool isNormalizedKeyMode>
   void buildFullProbe(
       ProbeState& state,
       uint64_t hash,
@@ -1233,12 +1427,124 @@ class HashTable : public BaseHashTable {
       bool extraCheck,
       TableInsertPartitionInfo* partitionInfo);
 
-  template <bool isNormailizedKeyMode>
+  template <bool isNormalizedKeyMode>
   void insertForJoinWithPrefetch(
       char** groups,
       uint64_t* hashes,
       int32_t numGroups,
       TableInsertPartitionInfo* partitionInfo);
+
+  struct ProbeCollisionEntry {
+    int64_t bucketOffset_;
+    BaseHashTable::TagVector wantedTags_;
+    int32_t row_;
+  };
+
+  struct InsertCollisionEntry {
+    int64_t bucketOffset_;
+    BaseHashTable::TagVector wantedTags_;
+    char* group_;
+    uint64_t hash_;
+  };
+
+  /// Hash table probing batch configuration.
+  static constexpr int32_t kPrefetchSize = 64;
+  static constexpr int32_t kSequentialThreshold = 8;
+
+  /// Processes hash collisions for normalized key probe, delegating to
+  /// sequential and prefetch batch handlers based on queue size.
+  void processProbeCollisions(
+      std::vector<ProbeCollisionEntry>& collisionQueue,
+      ProbeState* states,
+      const uint64_t* keys,
+      char** hits);
+
+  /// Handles a batch of probe collision entries sequentially (batch size
+  /// ≤ kSequentialThreshold).
+  void processProbeCollisionSequential(
+      ProbeState* states,
+      std::vector<ProbeCollisionEntry>& collisionQueue,
+      int32_t start,
+      int32_t count,
+      const uint64_t* keys,
+      char** hits);
+
+  /// Handles a batch of probe collision entries with prefetch (batch size
+  /// > kSequentialThreshold). Unresolved entries are pushed into
+  /// `newQueue`.
+  void processProbeCollisionPrefetch(
+      std::vector<ProbeCollisionEntry>& collisionQueue,
+      int32_t start,
+      int32_t count,
+      const uint64_t* keys,
+      char** hits,
+      std::vector<ProbeCollisionEntry>& newQueue);
+
+  /// Probes a single hash table entry for a normalized key.
+  /// If no match is found and the slot is not empty, the entry is added
+  /// to `collisionQueue`.
+  void probeSingleEntry(
+      ProbeState& state,
+      const uint64_t* keys,
+      char** hits,
+      std::vector<ProbeCollisionEntry>& collisionQueue);
+
+  /// Processes hash collisions for insert with prefetch.
+  template <bool isNormalizedKeyMode>
+  void processInsertCollisions(
+      std::vector<InsertCollisionEntry>& collisionQueue,
+      ProbeState* states,
+      char** groups,
+      uint64_t* hashes,
+      TableInsertPartitionInfo* partitionInfo);
+
+  /// Handles a batch of insert collision entries sequentially (batch size
+  /// ≤ kSequentialThreshold).
+  template <bool isNormalizedKeyMode>
+  void processInsertCollisionSequential(
+      ProbeState* states,
+      std::vector<InsertCollisionEntry>& collisionQueue,
+      int32_t start,
+      int32_t count,
+      char** groups,
+      uint64_t* hashes,
+      TableInsertPartitionInfo* partitionInfo);
+
+  /// Handles a batch of insert collision entries with prefetch (batch size
+  /// > kSequentialThreshold). Unresolved entries are pushed into
+  /// `newQueue`.
+  template <bool isNormalizedKeyMode>
+  void processInsertCollisionPrefetch(
+      std::vector<InsertCollisionEntry>& collisionQueue,
+      int32_t start,
+      int32_t count,
+      char** groups,
+      uint64_t* hashes,
+      TableInsertPartitionInfo* partitionInfo,
+      std::vector<InsertCollisionEntry>& newQueue);
+
+  /// Allocates an empty slot for an insert collision entry.
+  /// Returns true if the slot was allocated successfully.
+  template <bool isNormalizedKeyMode>
+  bool allocateInsertSlot(
+      InsertCollisionEntry& entry,
+      uint16_t emptyMask,
+      TableInsertPartitionInfo* partitionInfo);
+
+  /// Tries to insert a single row into the hash table.
+  /// `skipGroup` is used to avoid comparing against the group that was
+  /// already checked during the initial probe pass.
+  template <bool isNormalizedKeyMode>
+  bool tryInsertOne(
+      ProbeState& state,
+      char* row,
+      uint64_t hash,
+      char* skipGroup,
+      TableInsertPartitionInfo* partitionInfo);
+
+  /// Returns true if two rows have equal hash keys.
+  /// lhs and rhs are non-const because normalizedKey() mutates inline data.
+  bool rowKeysMatch(char* lhs, char* rhs, bool useNormalizedKey);
 
   // Updates 'hashers_' to correspond to the keys in the
   // content. Returns true if all hashers offer a mapping to value ids
@@ -1253,6 +1559,15 @@ class HashTable : public BaseHashTable {
   // join build sides.
   int32_t reservePct() const {
     return (isJoinBuild_ && !joinBuildNoDuplicates_) ? 0 : 50;
+  }
+
+  // Returns true if the current hash mode is one of the plain hash
+  // modes: kHash (when enableTaper_ is false) or kTaperHash (when
+  // enableTaper_ is true).
+  bool isPlainHashMode() const {
+    return enableTaper_
+        ? hashMode_ == HashMode::kTaperHash
+        : hashMode_ == HashMode::kHash;
   }
 
   // Returns the byte offset of the bucket for 'hash' starting from 'table_'.
@@ -1330,7 +1645,7 @@ class HashTable : public BaseHashTable {
   // The min table size in row to trigger parallel join table build.
   const uint32_t minTableSizeForParallelJoinBuild_;
 
-  int8_t sizeBits_;
+  int8_t sizeBits_{0};
   bool isJoinBuild_ = false;
   bool joinBuildNoDuplicates_ = false;
 
@@ -1455,8 +1770,19 @@ class HashTable : public BaseHashTable {
   std::vector<std::list<std::vector<char*>>> nexts_;
 
   bool enableJit_{false};
+  bool enableTaper_{false};
+  bool isFlatTaper_{false};
+  TaperFlatHashTableWrapper taperTableWrapper_;
   RowEqVectors rowEqVectorsFunc_{nullptr};
   RowRowCompare rowEqRowFunc_{nullptr};
+
+  // Reusable memory
+  SelectivityVector activeRows_;
+  std::vector<vector_size_t> workingUpdateIndices_;
+  std::vector<char*> workingUpdateRows_;
+  std::string eqHelperString_;
+  DecodedVector aggVector_;
+
 #ifdef ENABLE_BOLT_JIT
   bolt::jit::CompiledModuleSP jitModule_;
   bolt::jit::CompiledModuleSP jitModuleRow_;

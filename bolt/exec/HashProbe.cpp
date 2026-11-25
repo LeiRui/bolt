@@ -496,8 +496,9 @@ void HashProbe::asyncWaitForHashTable() {
       (isInnerJoin(joinType_) || isLeftSemiFilterJoin(joinType_) ||
        isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_) ||
        isRightJoin(joinType_)) &&
-      table_->hashMode() != BaseHashTable::HashMode::kHash && !isSpillInput() &&
-      !hasMoreSpillData()) {
+      (table_->hashMode() != BaseHashTable::HashMode::kHash &&
+       table_->hashMode() != BaseHashTable::HashMode::kTaperHash) &&
+      !isSpillInput() && !hasMoreSpillData()) {
     // Find out whether there are any upstream operators that can accept
     // dynamic filters on all or a subset of the join keys. Create dynamic
     // filters to push down.
@@ -738,6 +739,8 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 }
 
 void HashProbe::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeAddInputCalls);
   if (skipInput_) {
     BOLT_CHECK_NULL(input_);
     return;
@@ -810,7 +813,6 @@ void HashProbe::addInput(RowVectorPtr input) {
     lockedStats->numNullKeys +=
         activeRows_.size() - activeRows_.countSelected();
   }
-
   table_->prepareForJoinProbe(*lookup_.get(), input_, activeRows_, false);
 
   passingInputRowsInitialized_ = false;
@@ -1164,6 +1166,8 @@ void HashProbe::checkStateTransition(ProbeOperatorState state) {
 }
 
 RowVectorPtr HashProbe::getOutput() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeGetOutputCalls);
   if (isFinished()) {
     return nullptr;
   }
@@ -1246,6 +1250,7 @@ RowVectorPtr HashProbe::getOutput() {
         }
       }
     } else {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeListJoinResultsCalls);
       if (probeRangePartition_ && needLastProbeSideOutput() && includingMiss_) {
         numOut = table_->listJoinResults(
             results_,
@@ -1275,7 +1280,10 @@ RowVectorPtr HashProbe::getOutput() {
     }
     BOLT_CHECK_LE(numOut, outputTableRows_.size());
 
-    numOut = evalFilter(numOut);
+    {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeEvalFilterCalls);
+      numOut = evalFilter(numOut);
+    }
 
     if (!numOut) {
       continue;
@@ -1295,7 +1303,10 @@ RowVectorPtr HashProbe::getOutput() {
       return nullptr;
     }
 
-    fillOutput(numOut);
+    {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeFillOutputCalls);
+      fillOutput(numOut);
+    }
 
     if (isLeftSemiOrAntiJoinNoFilter || emptyBuildSide) {
       input_ = nullptr;

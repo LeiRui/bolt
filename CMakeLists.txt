@@ -932,6 +932,8 @@ endif()
 if(BOLT_ENABLE_CUDF)
   set(BOLT_ENABLE_ARROW ON)
   find_package(cudf CONFIG REQUIRED)
+  find_package(Snappy REQUIRED)
+  target_link_libraries(arrow::arrow INTERFACE Snappy::snappy)
 endif()
 
 if(${BOLT_ENABLE_SPARK_COMPATIBLE})

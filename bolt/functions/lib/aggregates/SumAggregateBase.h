@@ -35,6 +35,8 @@
 #include "bolt/functions/lib/aggregates/AggregateToIntermediate.h"
 #include "bolt/functions/lib/aggregates/DecimalAggregate.h"
 #include "bolt/functions/lib/aggregates/SimpleNumericAggregate.h"
+#include "bolt/vector/DecodedVector.h"
+
 namespace bytedance::bolt::functions::aggregate {
 inline bool Overflow = false;
 
@@ -144,6 +146,55 @@ class SumAggregateBase
         &updateDuplicateValues<TAccumulator>,
         mayPushdown,
         TAccumulator(0));
+  }
+
+  template <
+      DecodedVector::Layout layout,
+      typename TData = ResultType,
+      typename TValue = TInput>
+  void updateGroup(char* group, uint32_t rowIdx) {
+    if (BaseAggregate::inputDecoded_.template isNullAt<layout>(rowIdx)) {
+      return;
+    }
+    auto val =
+        BaseAggregate::inputDecoded_.template valueAt<TValue, layout>(rowIdx);
+    updateSingleValue(*exec::Aggregate::value<TData>(group), TData(val));
+    if (exec::Aggregate::isNull(group)) {
+      exec::Aggregate::numNulls_--;
+      group[BaseAggregate::nullByte_] &= BaseAggregate::nullUnMask_;
+    }
+  }
+
+  template <
+      DecodedVector::Layout layout,
+      typename TData = ResultType,
+      typename TValue = TInput>
+  void updateGroup(DecodedVector& decoded, char* group, uint32_t rowIdx) {
+    if (decoded.template isNullAt<layout>(rowIdx)) {
+      return;
+    }
+    auto val = decoded.template valueAt<TValue, layout>(rowIdx);
+    updateSingleValue(*exec::Aggregate::value<TData>(group), TData(val));
+    if (exec::Aggregate::isNull(group)) {
+      exec::Aggregate::numNulls_--;
+      group[BaseAggregate::nullByte_] &= BaseAggregate::nullUnMask_;
+    }
+  }
+
+  template <typename TData = ResultType, typename TValue = TInput>
+  void updateGroup(TValue val, char* group) {
+    updateSingleValue(*exec::Aggregate::value<TData>(group), TData(val));
+    if (exec::Aggregate::isNull(group)) {
+      exec::Aggregate::numNulls_--;
+      group[BaseAggregate::nullByte_] &= BaseAggregate::nullUnMask_;
+    }
+  }
+
+  void initializeNewGroup(char* group) {
+    *exec::Aggregate::value<TAccumulator>(group) = 0;
+    // initialized flag is not needed for sum aggregate
+    group[BaseAggregate::nullByte_] |= BaseAggregate::nullMask_;
+    exec::Aggregate::numNulls_++;
   }
 
  protected:

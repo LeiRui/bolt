@@ -29,12 +29,18 @@
  */
 
 #include "bolt/exec/GroupingSet.h"
+
+#include <algorithm>
+
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/base/SpillConfig.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/common/time/Timer.h"
+#include "bolt/exec/Aggregate.h"
 #include "bolt/exec/ContainerRow2RowSerde.h"
+#include "bolt/exec/HashTable.h"
 #include "bolt/exec/OperatorUtils.h"
+#include "bolt/exec/RowContainer.h"
 #include "bolt/exec/RowToColumnVector.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/ComplexVector.h"
@@ -73,7 +79,8 @@ GroupingSet::GroupingSet(
     const std::optional<column_index_t>& groupIdChannel,
     const common::SpillConfig* spillConfig,
     tsan_atomic<bool>* nonReclaimableSection,
-    OperatorCtx* operatorCtx)
+    OperatorCtx* operatorCtx,
+    bool enableTaper)
     : preGroupedKeyChannels_(std::move(preGroupedKeys)),
       hashers_(std::move(hashers)),
       isGlobal_(hashers_.empty()),
@@ -95,7 +102,8 @@ GroupingSet::GroupingSet(
       isAdaptive_(queryConfig_.hashAdaptivityEnabled()),
       pool_(*operatorCtx->pool()),
       operatorCtx_(operatorCtx),
-      bypassHTDistinctRatio_(queryConfig_.spilledAggregationBypassHTRatio()) {
+      bypassHTDistinctRatio_(queryConfig_.spilledAggregationBypassHTRatio()),
+      enableTaper_(enableTaper) {
   BOLT_CHECK_NOT_NULL(nonReclaimableSection_);
   BOLT_CHECK(pool_.trackUsage());
 
@@ -257,6 +265,10 @@ void GroupingSet::addInputForActiveRows(
   BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::GroupingSet::addInputForActiveRows", this);
 
+  // mark if aggregate is done in probe step
+  // **NOTE**: lookup_->hits and lookup_->newGroups maybe UNFILLED in this case.
+  auto aggregateDoneInProbe = false;
+
   if (!bypassProbeHT_) { // probing time
     NanosecondTimer probeTimer(&stats_.aggProbeTimeNs);
     table_->prepareForGroupProbe(
@@ -270,8 +282,21 @@ void GroupingSet::addInputForActiveRows(
       // have null keys.
       return;
     }
-    table_->groupProbe(*lookup_);
     masks_.addInput(input, activeRows_);
+
+    // taper flat mode should do aggregation in probe
+    if (table_->isTaperFlatMode(table_->hashMode())) {
+      auto aggIndex = getIndexOfTheOnlyAggregateFunction(false);
+      BOLT_CHECK(aggIndex.has_value());
+      auto i = aggIndex.value();
+      populateTempVectors(i, input);
+      const auto& rows = getSelectivityVector(i);
+      table_->groupProbe(
+          *lookup_, aggregates_[i], tempVectors_, rows, isRawInput_);
+      aggregateDoneInProbe = true;
+    } else {
+      table_->groupProbe(*lookup_);
+    }
   } else {
     // if there are too many distinct group-by keys and they should be spilled,
     // we can bypass probing the hash table, directly add rows to the table. In
@@ -286,6 +311,10 @@ void GroupingSet::addInputForActiveRows(
       return;
     }
     masks_.addInput(input, activeRows_);
+  }
+
+  if (aggregateDoneInProbe) {
+    return;
   }
 
   // agg func time
@@ -403,8 +432,51 @@ std::vector<Accumulator> GroupingSet::accumulators(bool excludeToIntermediate) {
   return accumulators;
 }
 
+std::optional<int> GroupingSet::getIndexOfTheOnlyAggregateFunction(
+    bool excludeToIntermediate) {
+  if (sortedAggregations_ != nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<int> result;
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    if (aggregates_[i].distinct) {
+      return std::nullopt;
+    }
+    if (!excludeToIntermediate ||
+        !aggregates_[i].function->supportsToIntermediate()) {
+      if (result.has_value()) {
+        return std::nullopt;
+      }
+      result = i;
+    }
+  }
+
+  return result;
+}
+
+namespace {
+FOLLY_ALWAYS_INLINE
+bool isFlatCompatible(AggregateInfo& agg) {
+  if (agg.inputs.size() != 1) {
+    return false;
+  }
+  return std::visit(
+      bolt::Overload{
+          [&](std::monostate&) { return false; },
+          [&](auto& aggFuncRef) {
+            auto* func = static_cast<Aggregate*>(&aggFuncRef.get());
+            return BaseHashTable::isFlatCompatibleAggregate(func);
+          }},
+      agg.rowBasedAggVars.vars);
+}
+}; // namespace
+
 void GroupingSet::createHashTable() {
   bool jitRowEqVectors = queryConfig_.enableJitRowEqVectors();
+  auto aggIndex = getIndexOfTheOnlyAggregateFunction(false);
+  bool supportFlatTaper = !ignoreNullKeys_ && aggIndex.has_value() &&
+      isFlatCompatible(aggregates_[aggIndex.value()]);
   if (ignoreNullKeys_) {
     table_ = HashTable<true>::createForAggregation(
         std::move(hashers_),
@@ -413,7 +485,9 @@ void GroupingSet::createHashTable() {
         nullptr,
         jitRowEqVectors,
         queryConfig_.useMonoAlloc(),
-        queryConfig_.simdHashTableEnabled());
+        queryConfig_.simdHashTableEnabled(),
+        enableTaper_,
+        supportFlatTaper);
   } else {
     table_ = HashTable<false>::createForAggregation(
         std::move(hashers_),
@@ -422,7 +496,9 @@ void GroupingSet::createHashTable() {
         nullptr,
         jitRowEqVectors,
         queryConfig_.useMonoAlloc(),
-        queryConfig_.simdHashTableEnabled());
+        queryConfig_.simdHashTableEnabled(),
+        enableTaper_,
+        supportFlatTaper);
   }
 
   RowContainer& rows = *table_->rows();
@@ -458,7 +534,7 @@ void GroupingSet::createHashTable() {
   }
 
   lookup_ = std::make_unique<HashLookup>(table_->hashers(), jitRowEqVectors);
-  if (!isAdaptive_ && table_->hashMode() != BaseHashTable::HashMode::kHash) {
+  if (!isAdaptive_ && !table_->isGenericHashMode(table_->hashMode())) {
     table_->forceGenericHashMode();
   }
 
@@ -817,10 +893,19 @@ bool GroupingSet::getOutput(
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-  const int32_t numGroups = table_
-      ? table_->rows()->listRows(
-            &iterator, maxOutputRows, maxOutputBytes, groups)
-      : 0;
+  int32_t numGroups = 0;
+  if (table_) {
+    // TODO(refactor): extract generic listRows in table_ or extract an
+    // interface for RowContainer
+    if (table_->isTaperFlatMode(table_->hashMode())) {
+      // flat taper: extract keys here as they are not included in groups.
+      numGroups = table_->flatRows()->listRows(
+          &iterator, maxOutputRows, maxOutputBytes, groups);
+    } else {
+      numGroups = table_->rows()->listRows(
+          &iterator, maxOutputRows, maxOutputBytes, groups);
+    }
+  }
   if (numGroups == 0) {
     if (table_ != nullptr) {
       table_->clear();
@@ -1138,11 +1223,17 @@ void GroupingSet::spill() {
     spiller_->setSpillConfig(spillConfig_);
     BOLT_CHECK_EQ(spiller_->state().maxPartitions(), 1);
   }
+  auto isFlat = table_->isTaperFlatMode(table_->hashMode());
+  auto numRows = table_->numDistinct();
   LOG(INFO) << operatorCtx_->toString()
-            << " spill row container, row number: " << table_->rows()->numRows()
+            << " spill row container, row number: " << numRows
             << ", bytes: " << table_->rows()->allocatedBytes()
             << ", probe ratio = " << table_->getDistinctRatio();
-  spiller_->spill();
+  if (isFlat) {
+    spiller_->spill(table_->flatRows());
+  } else {
+    spiller_->spill();
+  }
   if (isDistinct() && numDistinctSpilledFiles_ == 0) {
     numDistinctSpilledFiles_ = spiller_->state().numFinishedFiles(0);
     BOLT_CHECK_GT(numDistinctSpilledFiles_, 0);
@@ -1164,12 +1255,14 @@ void GroupingSet::adjustBypassHashTable(common::SpillConfig* spillConf) {
   // 1. less next equal rows in sorted rows if bypassed
   // 2. too many distinct keys from hash tables if not bypassed
   bool oldBypassProbeHT = bypassProbeHT_;
+  auto numRows = table_->isTaperFlatMode(table_->hashMode())
+      ? table_->numDistinct()
+      : table_->rows()->numRows();
   bypassProbeHT_ = spillConfig_ &&
       spillConfig_->rowBasedSpillMode != common::RowBasedSpillMode::DISABLE &&
-      (oldBypassProbeHT
-           ? table_->rows()->numRows() - spillConf->aggBypassHTEqualNum >=
-               table_->rows()->numRows() * bypassHTDistinctRatio_
-           : table_->getDistinctRatio() >= bypassHTDistinctRatio_);
+      (oldBypassProbeHT ? numRows - spillConf->aggBypassHTEqualNum >=
+               numRows * bypassHTDistinctRatio_
+                        : table_->getDistinctRatio() >= bypassHTDistinctRatio_);
   if (oldBypassProbeHT != bypassProbeHT_) {
     LOG(INFO)
         << "The state of spilled aggregation bypass hash table is changed from "
@@ -1177,7 +1270,7 @@ void GroupingSet::adjustBypassHashTable(common::SpillConfig* spillConf) {
         << stats_.aggProbeBypassCount
         << ", bypassHTDistinctRatio_ = " << bypassHTDistinctRatio_
         << ", equalNum = " << spillConf->aggBypassHTEqualNum
-        << ", spill rows = " << table_->rows()->numRows()
+        << ", spill rows = " << numRows
         << ", offset = " << table_->rows()->probedFlagOffset()
         << ", needSetNextEqual = " << spillConf->needSetNextEqual
         << ", bypassHT = " << bypassProbeHT_;
@@ -1200,7 +1293,11 @@ void GroupingSet::spill(const RowContainerIterator& rowIterator) {
   spiller_ = std::make_unique<Spiller>(
       Spiller::Type::kAggregateOutput, rows, makeSpillType(), spillConfig_);
   spiller_->setSpillConfig(spillConfig_);
-  spiller_->spill(rowIterator);
+  if (table_->isTaperFlatMode(table_->hashMode())) {
+    spiller_->spill(rowIterator, table_->flatRows());
+  } else {
+    spiller_->spill(rowIterator);
+  }
   adjustBypassHashTable(spillConf);
   clearTableAfterSpill();
 }
@@ -2193,7 +2290,9 @@ std::optional<int64_t> GroupingSet::estimateOutputRowSize() const {
   if (table_ == nullptr || table_->numDistinct() == 0) {
     return std::nullopt;
   }
-
+  if (table_->isTaperFlatMode(table_->hashMode())) {
+    return table_->rows()->fixedRowSize();
+  }
   const auto rowSizeFromContainer = table_->rows()->estimateRowSize();
   if (!hasExternalMemoryAccumulators_) {
     return rowSizeFromContainer;
@@ -2208,6 +2307,33 @@ std::optional<int64_t> GroupingSet::estimateOutputRowSize() const {
   const int64_t rowSize =
       std::max<int64_t>(rowSizeFromPool, rowSizeFromContainer.value_or(0));
   return rowSize;
+}
+
+void GroupingSet::updateRuntimeStats(RuntimeStats& runtimeStats) {
+  // Report range sizes and number of distinct values for the group-by keys.
+  const auto& hashers = lookup_->hashers;
+  uint64_t asRange{0};
+  uint64_t asDistinct{0};
+  const auto hashTableStats = this->hashTableStats();
+
+  for (auto i = 0; i < hashers.size(); i++) {
+    hashers[i]->cardinality(0, asRange, asDistinct);
+    if (asRange != VectorHasher::kRangeTooLarge) {
+      runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);
+    }
+    if (asDistinct != VectorHasher::kRangeTooLarge) {
+      runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
+    }
+  }
+
+  runtimeStats["hashtable.capacity"] = RuntimeMetric(hashTableStats.capacity);
+  runtimeStats["hashtable.numRehashes"] =
+      RuntimeMetric(hashTableStats.numRehashes);
+  runtimeStats["hashtable.numDistinct"] =
+      RuntimeMetric(hashTableStats.numDistinct);
+  runtimeStats["hashtable.numTombstones"] =
+      RuntimeMetric(hashTableStats.numTombstones);
+  detail::addHashModeRuntimeStats(runtimeStats, hashMode());
 }
 
 void GroupingSet::convertCompositeInput(

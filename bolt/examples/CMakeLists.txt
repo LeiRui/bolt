@@ -50,6 +50,16 @@ add_executable(bolt_example_scan_orc ScanOrc.cpp)
 
 target_link_libraries(bolt_example_scan_orc bolt_testutils)
 
+add_executable(bolt_example_taper_hash TaperHash.cpp)
+
+target_link_libraries(
+  bolt_example_taper_hash
+  bolt_type
+  bolt_vector
+  bolt_exec
+  bolt_memory
+)
+
 add_executable(bolt_example_vector_reader_writer VectorReaderWriter.cpp)
 
 target_link_libraries(bolt_example_vector_reader_writer bolt_testutils)

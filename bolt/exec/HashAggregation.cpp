@@ -28,19 +28,34 @@
  * --------------------------------------------------------------------------
  */
 
-#include "bolt/exec/HashAggregation.h"
-#include <folly/ScopeGuard.h>
-#include <signal.h>
+#include <algorithm>
 #include <iostream>
 #include <optional>
+#include <signal.h>
+#include <vector>
+
+#include <folly/ScopeGuard.h>
+
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/exec/Aggregate.h"
+#include "bolt/exec/AggregateInfo.h"
+#include "bolt/exec/DebugStat.h"
+#include "bolt/exec/GroupAggregation.h"
+#include "bolt/exec/GroupingSet.h"
+#include "bolt/exec/HashAggregation.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/SortedAggregations.h"
 #include "bolt/exec/Task.h"
 #include "bolt/expression/Expr.h"
+
+#if defined(__aarch64__)
+#define BOLT_AGG_ENABLE_TAPER true
+#else
+#define BOLT_AGG_ENABLE_TAPER false
+#endif
+
 namespace bytedance::bolt::exec {
 
 HashAggregation::HashAggregation(
@@ -175,9 +190,9 @@ void HashAggregation::initialize() {
     BOLT_CHECK(groupIdChannel.has_value());
   }
 
-  acceptCompositeVectorInput_ = canUseRowBasedSpill && !isGlobal_ &&
-      !hasDistinctAgg && (alignment == 1) && !isDistinct_ && (alignment == 1) &&
-      queryConf.isHashAggregationCompositeOutputEnabled() &&
+  acceptCompositeVectorInput_ = !BOLT_AGG_ENABLE_TAPER &&
+      canUseRowBasedSpill && !isGlobal_ && !hasDistinctAgg && !isDistinct_ &&
+      alignment == 1 && queryConf.isHashAggregationCompositeOutputEnabled() &&
       (aggregateInfos.size() >=
        hashers.size() * queryConf.hashAggregationCompositeAccumulatorRatio());
 
@@ -186,6 +201,7 @@ void HashAggregation::initialize() {
   addRuntimeStat(
       "aggregationOutputCompositeVector",
       RuntimeCounter(supportRowBasedOutput_));
+
   groupingSet_ = std::make_unique<GroupingSet>(
       inputType,
       std::move(hashers),
@@ -198,7 +214,8 @@ void HashAggregation::initialize() {
       groupIdChannel,
       spillConfig_.has_value() ? &spillConfig_.value() : nullptr,
       &nonReclaimableSection_,
-      operatorCtx_.get());
+      operatorCtx_.get(),
+      BOLT_AGG_ENABLE_TAPER);
 
   groupingSet_->setPreferPartialSpill(preferPartialSpill_);
   groupingSet_->setSupportRowBasedOutput(supportRowBasedOutput_);
@@ -265,6 +282,8 @@ bool HashAggregation::preferPartialSpill(
 }
 
 void HashAggregation::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_)
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::OperatorAddInputCalls)
   if (!pushdownChecked_) {
     mayPushdown_ = operatorCtx_->driver()->mayPushdownAggregation(this);
     pushdownChecked_ = true;
@@ -338,7 +357,7 @@ void HashAggregation::addInput(RowVectorPtr input) {
   }
 
   if (isDistinct_) {
-    newDistincts_ = !groupingSet_->hashLookup().distinctNewGroups.empty();
+    newDistincts_ = groupingSet_->distinctNewGroupsNum() > 0;
 
     if (newDistincts_) {
       // Save input to use for output in getOutput().
@@ -353,34 +372,8 @@ void HashAggregation::addInput(RowVectorPtr input) {
 }
 
 void HashAggregation::updateRuntimeStats() {
-  // Report range sizes and number of distinct values for the group-by keys.
-  const auto& hashers = groupingSet_->hashLookup().hashers;
-  uint64_t asRange;
-  uint64_t asDistinct;
-  const auto hashTableStats = groupingSet_->hashTableStats();
-  const auto hashMode = groupingSet_->hashMode();
-
   auto lockedStats = stats_.wlock();
-  auto& runtimeStats = lockedStats->runtimeStats;
-
-  for (auto i = 0; i < hashers.size(); i++) {
-    hashers[i]->cardinality(0, asRange, asDistinct);
-    if (asRange != VectorHasher::kRangeTooLarge) {
-      runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);
-    }
-    if (asDistinct != VectorHasher::kRangeTooLarge) {
-      runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
-    }
-  }
-
-  runtimeStats["hashtable.capacity"] = RuntimeMetric(hashTableStats.capacity);
-  runtimeStats["hashtable.numRehashes"] =
-      RuntimeMetric(hashTableStats.numRehashes);
-  runtimeStats["hashtable.numDistinct"] =
-      RuntimeMetric(hashTableStats.numDistinct);
-  runtimeStats["hashtable.numTombstones"] =
-      RuntimeMetric(hashTableStats.numTombstones);
-  detail::addHashModeRuntimeStats(runtimeStats, hashMode);
+  groupingSet_->updateRuntimeStats(lockedStats->runtimeStats);
 }
 
 void HashAggregation::recordSpillStats() {
@@ -543,6 +536,8 @@ void triggerSegfault() {
 }
 
 RowVectorPtr HashAggregation::getOutput() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_)
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::OperatorGetOutputCalls)
   if (BOLT_TEST_VALUE_ENABLED()) {
     bool injectSegfault = false;
     BOLT_TEST_ADJUST(
@@ -660,16 +655,10 @@ RowVectorPtr HashAggregation::getDistinctOutput() {
   if (newDistincts_) {
     BOLT_CHECK_NOT_NULL(input_);
 
-    const auto& distinctNewGroups =
-        groupingSet_->hashLookup().distinctNewGroups;
-
     // Accumulate results from all saved batches
-    const auto size = distinctNewGroups.size();
+    const auto size = groupingSet_->distinctNewGroupsNum();
     BufferPtr indices = allocateIndices(size, operatorCtx_->pool());
-    auto indicesPtr = indices->asMutable<vector_size_t>();
-
-    // Copy all batches into indices buffer
-    std::copy(distinctNewGroups.begin(), distinctNewGroups.end(), indicesPtr);
+    groupingSet_->getNewGroupIndices(indices);
 
     newDistincts_ = false;
     auto output = fillOutput(size, indices);

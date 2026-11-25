@@ -39,7 +39,9 @@
 #include "bolt/common/base/BitUtil.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/exec/HybridSorter.h"
+#include "bolt/exec/RowContainer.h"
 #include "bolt/exec/Spiller.h"
+#include "bolt/exec/TaperHashTableWrapper.h"
 #include "bolt/type/StringView.h"
 
 #ifdef ENABLE_META_SORT
@@ -800,32 +802,28 @@ bool Spiller::needSort() const {
 }
 
 void Spiller::spill() {
-  return spill(nullptr);
+  return spill(nullptr, container_);
 }
 
 void Spiller::spill(const RowContainerIterator& startRowIter) {
   BOLT_CHECK_EQ(type_, Type::kAggregateOutput);
-  return spill(&startRowIter);
+  return spill(&startRowIter, container_);
 }
 
-void Spiller::spill(const RowContainerIterator* startRowIter) {
-  CHECK_NOT_FINALIZED();
-  BOLT_CHECK(
-      type_ != Type::kHashJoinProbe && type_ != Type::kOrderByOutput &&
-      type_ != Type::kLocalMergeInput);
+template <typename GenericRowContainer>
+void Spiller::spill(
+    const RowContainerIterator* startRowIter,
+    GenericRowContainer* container) {
+  BOLT_CHECK(!finalized_, "Spiller has been finalized");
+  BOLT_CHECK_NE(type_, Type::kHashJoinProbe);
+  BOLT_CHECK_NE(type_, Type::kOrderByOutput);
+  const bool doPotentialRangePartitionCheck =
+      (supportSkewPartition_ && container &&
+       container->numRows() > std::max(maxSpillRunRows_, kDefaultSpillRunRows));
   uint64_t totalTimeUs{0};
   {
     MicrosecondTimer timer(&totalTimeUs);
 
-    uint64_t maxRowsPerPartition{0};
-    if (supportSkewPartition_) {
-      if (skewedVictim_.has_value() && maxRowsPerFile_ > 0) {
-        maxRowsPerPartition = maxRowsPerFile_;
-      } else if (!isAnySpilled()) {
-        maxRowsPerPartition =
-            bits::divRoundUp(container_->numRows(), state_.maxPartitions());
-      }
-    }
     markAllPartitionsSpilled();
 
     RowContainerIterator rowIter;
@@ -835,7 +833,7 @@ void Spiller::spill(const RowContainerIterator* startRowIter) {
 
     bool lastRun{false};
     do {
-      lastRun = fillSpillRuns(&rowIter, maxRowsPerPartition);
+      lastRun = fillSpillRuns(&rowIter, container);
       runSpill(lastRun);
       if (supportSkewPartition_ || skewedVictim_.has_value()) {
         prepareForRangPartitionIfNeeded();
@@ -947,9 +945,11 @@ void Spiller::finalizeSpill() {
   finalized_ = true;
 }
 
+template <typename GenericRowContainer>
 bool Spiller::fillSpillRuns(
-    RowContainerIterator* iterator,
-    const uint64_t maxRowsPerPartition) {
+    RowContainerIterator* startRowIter,
+    GenericRowContainer* container) {
+  BOLT_CHECK_NOT_NULL(container);
   checkEmptySpillRuns();
   bool lastRun{false};
   uint64_t execTimeUs{0};
@@ -963,10 +963,9 @@ bool Spiller::fillSpillRuns(
     const bool isSinglePartition = bits_.numPartitions() == 1;
 
     uint64_t totalRows{0};
-    bool maxRowsPerPartitionReached = false;
     for (;;) {
-      const auto numRows =
-          container_->listRows(iterator, rows.size(), rows.data());
+      const auto numRows = container->listRows(
+          startRowIter, rows.size(), RowContainer::kUnlimited, rows.data());
       if (numRows == 0) {
         lastRun = true;
         break;
@@ -993,19 +992,7 @@ bool Spiller::fillSpillRuns(
         spillRuns_[partition].numBytes += container_->rowSize(rows[i]);
       }
       totalRows += numRows;
-      // Stop filling this run once any partition reaches the per-partition row
-      // target, so the skewed partition can be identified before writing an
-      // oversized spill file.
-      if (maxRowsPerPartition > 0 && !maxRowsPerPartitionReached) {
-        for (auto partition = 0; partition < spillRuns_.size(); ++partition) {
-          if (spillRuns_[partition].rows.size() >= maxRowsPerPartition) {
-            maxRowsPerPartitionReached = true;
-            break;
-          }
-        }
-      }
-      if ((maxSpillRunRows_ > 0 && totalRows >= maxSpillRunRows_) ||
-          maxRowsPerPartitionReached) {
+      if (maxSpillRunRows_ > 0 && totalRows >= maxSpillRunRows_) {
         break;
       }
     }
@@ -1197,4 +1184,11 @@ std::string Spiller::typeName(Type type) {
 common::SpillStats Spiller::stats() const {
   return stats_.copy();
 }
+
+// template explicit instantiate
+template void Spiller::spill(const RowContainerIterator*, RowContainer*);
+template void Spiller::spill(
+    const RowContainerIterator*,
+    TaperFlatHashTableWrapper::FlatRowContainer*);
+
 } // namespace bytedance::bolt::exec

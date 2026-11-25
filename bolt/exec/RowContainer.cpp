@@ -282,7 +282,9 @@ RowContainer::RowContainer(
   }
   // Make offset at least sizeof pointer so that there is space for a
   // free list next pointer below the bit at 'freeFlagOffset_'.
-  offset = std::max<int32_t>(offset, sizeof(void*));
+  if (offset) {
+    offset = std::max<int32_t>(offset, sizeof(void*));
+  }
   const int32_t firstAggregateOffset = offset;
   for (const auto& accumulator : accumulators) {
     nullOffsets_.push_back(nullOffset);
@@ -1174,6 +1176,7 @@ void RowContainer::extractContinuousStringsBatch(
   }
 }
 
+template <DVecLayout Layout>
 void RowContainer::storeComplexType(
     const DecodedVector& decoded,
     vector_size_t index,
@@ -1183,11 +1186,11 @@ void RowContainer::storeComplexType(
     int32_t nullByte,
     uint8_t nullMask,
     int32_t column) {
-  if (decoded.isNullAt(index)) {
+  if (decoded.isNullAt<Layout>(index)) {
     BOLT_DCHECK(nullMask);
     row[nullByte] |= nullMask;
     valueAt<std::string_view>(row, offset) = std::string_view();
-    updateColumnHasNulls(column);
+    recordStoredNull(column, offset, nullByte, nullMask);
     return;
   }
   // RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
@@ -1195,7 +1198,7 @@ void RowContainer::storeComplexType(
   auto position = stringAllocator_->newWrite(stream);
   ContainerRowSerdeOptions options{.isKey = isKey};
   ContainerRowSerde::serialize(
-      *decoded.base(), decoded.index(index), stream, options);
+      *decoded.base(), decoded.index<Layout>(index), stream, options);
   stringAllocator_->finishWrite(stream, 0);
 
   valueAt<std::string_view>(row, offset) = std::string_view(
@@ -1215,6 +1218,13 @@ void RowContainer::storeComplexType(
   *reinterpret_cast<uint32_t*>(row + rowSizeOffset_) =
       std::min<uint64_t>(value, std::numeric_limits<uint32_t>::max());
 }
+
+#define INSTANTIATE_STORE_COMPLEX(Layout) \
+  template void RowContainer::storeComplexType<Layout>( \
+      const DecodedVector&, vector_size_t, bool, char*, int32_t, int32_t, uint8_t, int32_t);
+INSTANTIATE_STORE_COMPLEX(DVecLayout::kUnknown)
+FOREACH_VALID_LAYOUT(INSTANTIATE_STORE_COMPLEX)
+#undef INSTANTIATE_STORE_COMPLEX
 
 void RowContainer::updateColumnHasNulls(const char* row) {
   for (int32_t i = 0; i < columnHasNulls_.size(); ++i) {

@@ -31,8 +31,27 @@
 #pragma once
 
 #include "bolt/core/PlanNode.h"
+#include "bolt/functions/lib/aggregates/SumAggregateBase.h"
 #include "bolt/vector/ComplexVector.h"
 namespace bytedance::bolt::exec {
+
+template <typename TInput, typename TAccumulator, typename ResultType>
+using SumAggregate = functions::aggregate::SumAggregateBase<TInput, TAccumulator, ResultType>;
+
+using RowBasedAggVars = std::variant<
+    std::monostate,
+    std::reference_wrapper<SumAggregate<double, double, double>>
+>;
+
+struct RowBasedAggVarsWrapper {
+  RowBasedAggVars vars;
+
+  template<typename T>
+  std::unique_ptr<T> set(std::unique_ptr<T> p) {
+    vars = *p;
+    return p;
+  }
+};
 
 class Aggregate;
 
@@ -40,6 +59,10 @@ class Aggregate;
 struct AggregateInfo {
   /// Instance of the Aggregate class.
   std::unique_ptr<Aggregate> function;
+
+  /// The concrete aggregate functions that supports updating with
+  /// row granularity
+  RowBasedAggVarsWrapper rowBasedAggVars;
 
   /// Indices of the input columns in the input RowVector.
   std::vector<column_index_t> inputs;

@@ -30,6 +30,7 @@
 
 #include "bolt/functions/sparksql/aggregates/SumAggregate.h"
 
+#include "bolt/exec/AggregateInfo.h"
 #include "bolt/functions/lib/aggregates/SumAggregateBase.h"
 #include "bolt/functions/sparksql/aggregates/DecimalSumAggregate.h"
 using namespace bytedance::bolt::functions::aggregate;
@@ -87,8 +88,9 @@ exec::AggregateRegistrationResult registerSum(
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
           const TypePtr& resultType,
-          const core::QueryConfig&
-          /*config*/) -> std::unique_ptr<exec::Aggregate> {
+          const core::QueryConfig& /*config*/,
+          exec::RowBasedAggVarsWrapper& varOut)
+          -> std::unique_ptr<exec::Aggregate> {
         BOLT_CHECK_EQ(argTypes.size(), 1, "{} takes only one argument", name);
         auto inputType = argTypes[0];
         switch (inputType->kind()) {
@@ -136,8 +138,9 @@ exec::AggregateRegistrationResult registerSum(
               return std::make_unique<SumAggregate<double, double, float>>(
                   resultType);
             }
-            return std::make_unique<SumAggregate<double, double, double>>(
-                DOUBLE());
+            return varOut.set(
+                std::make_unique<SumAggregate<double, double, double>>(
+                DOUBLE()));
           case TypeKind::ROW: {
             BOLT_DCHECK(!exec::isRawInput(step));
             auto sumType = getDecimalSumType(resultType, step);
