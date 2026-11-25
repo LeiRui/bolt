@@ -40,6 +40,7 @@ bolt_add_library(
   AssignUniqueId.cpp
   ContainerRow2RowSerde.cpp
   ContainerRowSerde.cpp
+  DebugStat.cpp
   DistinctAggregations.cpp
   Driver.cpp
   EnforceSingleRow.cpp

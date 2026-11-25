@@ -28,6 +28,7 @@
  * --------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -36,8 +37,14 @@
 #include <utility>
 #include <vector>
 
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
+
 #include <boost/sort/pdqsort/pdqsort.hpp>
+#include <exec/Aggregate.h>
 #include "bolt/common/base/AsyncSource.h"
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/base/Portability.h"
 #include "bolt/common/base/SimdUtil.h"
@@ -47,11 +54,21 @@
 #include "bolt/exec/HashTableSimd-inl.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
+#include "bolt/exec/TaperHashTable.h"
+#include "bolt/exec/TaperHashTableWrapper.h"
+#include "bolt/exec/VectorHasher.h"
+#include "bolt/functions/lib/aggregates/SumAggregateBase.h"
 #include "bolt/jit/RowContainer/RowContainerCodeGenerator.h"
 #include "bolt/type/StringView.h"
+#include "bolt/type/Type.h"
+#include "bolt/vector/DecodedVector.h"
+#include "bolt/vector/SelectivityVector.h"
+
 using bytedance::bolt::common::testutil::TestValue;
 using Operation = bytedance::bolt::exec::ProbeState::Operation;
+
 namespace bytedance::bolt::exec {
+
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
   switch (mode) {
@@ -61,6 +78,10 @@ std::string BaseHashTable::modeString(HashMode mode) {
       return "ARRAY";
     case HashMode::kNormalizedKey:
       return "NORMALIZED_KEY";
+    case HashMode::kTaperHash:
+      return "TAPER_HASH";
+    case HashMode::kTaperFlat:
+      return "TAPER_FLAT";
     default:
       return fmt::format(
           "Unknown HashTable mode:{}", static_cast<int32_t>(mode));
@@ -86,6 +107,48 @@ void detail::addHashModeRuntimeStats(
   }
 }
 
+template <typename TInput, typename TAccumulator, typename ResultType>
+using SumAggregate =
+    functions::aggregate::SumAggregateBase<TInput, TAccumulator, ResultType>;
+
+// Only Support Aggregate with accumulatorFixedWidthSize=8 and
+// accumulatorAlignmentSize=1
+#define FOREACH_FLAT_COMPATIBLE_AGGREGATE_CLASS(MACRO) \
+  MACRO(SumAggregate<double, double, double>)
+
+bool BaseHashTable::isFlatCompatibleAggregate(Aggregate* function) {
+#define DISPATCH(...)                                     \
+  if (auto* agg = dynamic_cast<__VA_ARGS__*>(function)) { \
+    return true;                                          \
+  }
+  FOREACH_FLAT_COMPATIBLE_AGGREGATE_CLASS(DISPATCH)
+  return false;
+#undef DISPATCH
+}
+
+namespace {
+bool isFlatTaperAvailable(
+    const std::vector<std::unique_ptr<VectorHasher>>& hashers,
+    const std::vector<Accumulator>& accumulators,
+    const std::vector<TypePtr>& dependentTypes,
+    RowContainer& rows) {
+  // flat table only support keys, accs, deps = 1, 1, 0
+  if (hashers.size() != 1 || accumulators.size() != 1 ||
+      !dependentTypes.empty()) {
+    return false;
+  }
+
+  // flat table does not support alignment and variable length
+  if (rows.alignment() != 1 || rows.rowSizeOffset() != 0) {
+    return false;
+  }
+
+  // keys and accs must fit in the predefined type and size
+  return TaperFlatHashTableWrapper::supportKeyTypeAndRowSize(
+      hashers.front()->type(), rows.fixedRowSize());
+}
+} // namespace
+
 template <bool ignoreNullKeys>
 HashTable<ignoreNullKeys>::HashTable(
     std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -100,13 +163,16 @@ HashTable<ignoreNullKeys>::HashTable(
     const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
     bool enableJit,
     bool useMonotonicStringAllocation,
-    bool hybridMode)
+    bool hybridMode,
+    bool enableTaper,
+    bool enableFlatTaper)
     : BaseHashTable(std::move(hashers)),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       isJoinBuild_(isJoinBuild),
       joinBuildNoDuplicates_(!allowDuplicates),
       hashMode_(mode),
-      enableJit_(enableJit) {
+      enableJit_(enableJit),
+      enableTaper_(enableTaper) {
   std::vector<TypePtr> keys;
   for (auto& hasher : hashers_) {
     keys.push_back(hasher->type());
@@ -149,6 +215,18 @@ HashTable<ignoreNullKeys>::HashTable(
             .useMonotonicStringAllocation = useMonotonicStringAllocation});
   }
   nextOffset_ = rows_->nextOffset();
+
+  isFlatTaper_ = enableTaper_ && enableFlatTaper &&
+      isFlatTaperAvailable(hashers_, accumulators, dependentTypes, *rows_);
+
+  if (isFlatTaper_) {
+    // if flat taper mode is supported, use it from start.
+    hashMode_ = HashMode::kTaperFlat;
+  } else if (enableTaper_ && hashMode_ == HashMode::kHash) {
+    // taper mode from initial kHash mode
+    hashMode_ = HashMode::kTaperHash;
+  }
+
 #ifdef ENABLE_BOLT_JIT // generate JIT lazily?
   if (enableJit_) {
     if (rows_->JITable(keys)) {
@@ -177,7 +255,9 @@ HashTable<ignoreNullKeys>::HashTable(
     const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
     bool enableJitRowEqVectors,
     bool useMonotonicStringAllocation,
-    bool hybridMode)
+    bool hybridMode,
+    bool enableTaper,
+    bool enableFlatTaper)
     : HashTable<ignoreNullKeys>(
           std::move(hashers),
           accumulators,
@@ -191,7 +271,9 @@ HashTable<ignoreNullKeys>::HashTable(
           stringArena,
           enableJitRowEqVectors,
           useMonotonicStringAllocation,
-          hybridMode) {}
+          hybridMode,
+          enableTaper,
+          enableFlatTaper) {}
 
 int32_t ProbeState::row() const {
   return row_;
@@ -442,7 +524,12 @@ bool HashTable<ignoreNullKeys>::compareKeys(
     auto numKeys = hashers_.size();
     int32_t i = 0;
     do {
-      if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
+      if (!rows_->equals<!ignoreNullKeys>(
+              group,
+              inserted,
+              rows_->columnAt(i),
+              hashers_[i]->type(),
+              eqHelperString_)) {
         return false;
       }
     } while (++i < numKeys);
@@ -616,6 +703,18 @@ void HashTable<ignoreNullKeys>::groupProbe(HashLookup& lookup) {
     arrayGroupProbe(lookup);
     return;
   }
+  if (hashMode_ == HashMode::kTaperHash) {
+    // ensure taper table is initialized before probe.
+    if (!taperTableWrapper_) {
+      checkSize(lookup.rows.size(), false);
+    }
+    groupTaperKeyProbe(lookup);
+    return;
+  }
+  if (hashMode_ == HashMode::kTaperFlat) {
+    BOLT_UNREACHABLE("taper flat should have been called separately");
+    return;
+  }
   // Do size-based rehash before mixing hashes from normalized keys
   // because the size of the table affects the mixing.
   checkSize(lookup.rows.size(), false);
@@ -704,14 +803,771 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
   }
 }
 
+namespace {
+
+char*& pointerAt(char* position) {
+  return *reinterpret_cast<char**>(position);
+}
+
+template <typename T>
+bool rowEqualsDecoded(T rowContainerVal, T decodedVal, std::string&) {
+  return rowContainerVal == decodedVal;
+}
+
+template <>
+bool rowEqualsDecoded(
+    StringView rowContainerVal,
+    StringView decodedVal,
+    std::string& tmpStrBuf) {
+  if (rowContainerVal.sizeAndPrefixAsInt64() !=
+      decodedVal.sizeAndPrefixAsInt64()) {
+    return false;
+  }
+  if (rowContainerVal.isInline()) {
+    return rowContainerVal.inlinedAsInt64() == decodedVal.inlinedAsInt64();
+  }
+  auto left = HashStringAllocator::contiguousString(rowContainerVal, tmpStrBuf);
+  return memcmp(left.value(), decodedVal.value(), decodedVal.size()) == 0;
+}
+
+#ifdef __ARM_FEATURE_SVE
+template <TypeKind Kind, DVecLayout Layout>
+void vBatchEquals(
+    char** rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices,
+    int32_t& mismatchNum) {
+  auto offset = column.offset();
+  auto nullByte = column.nullByte();
+  auto nullMask = column.nullMask();
+  std::string eqHelperStr;
+
+  const int32_t n = indices.size();
+  svbool_t pgAll = svptrue_b64();
+
+  for (int32_t i = mismatchNum; i < n;) {
+    // svwhilelt handles remainder automatically - no need for separate scalar
+    // fallback
+    svbool_t pg = svwhilelt_b64_s64((int64_t)i, (int64_t)n);
+    int32_t activeCount = svcntp_b64(pgAll, pg);
+
+    // ── Load indices once (uint32 → uint64), reused everywhere ──────────
+    svuint64_t vIdx = svld1uw_u64(pg, (uint32_t*)&indices[i]);
+
+    // ── Decoded null bitmap gather (unavoidable — scattered access) ──────
+    svuint64_t vWordIdx = svlsr_n_u64_x(pg, vIdx, 6);
+    svuint64_t vNullByteOff = svlsl_n_u64_x(pg, vWordIdx, 3);
+    svuint64_t vNullWords =
+        svld1_gather_offset_u64(pg, vNullByteOff, (uint64_t)decoded.nullBits());
+
+    // ── Row pointers: gather using v_idx ──
+    svuint64_t vPtrOffsets = svlsl_n_u64_x(pg, vIdx, 3);
+    svuint64_t vRowPtrs =
+        svld1_gather_offset_u64(pg, vPtrOffsets, (uint64_t)rows);
+
+    // ── Decoded null check ───────────────────────────────────────────────
+    svuint64_t vBitIdx = svand_n_u64_x(pg, vIdx, 63);
+    svuint64_t vNullMasks = svlsl_u64_x(pg, svdup_n_u64(1), vBitIdx);
+    svuint64_t vDecodedNotNull = svand_u64_x(pg, vNullWords, vNullMasks);
+    svbool_t vDecodedIsNull = svcmpeq_n_u64(pg, vDecodedNotNull, 0);
+
+    // ── Row null check ──────────────────────────────────────────────────
+    svuint64_t vNullAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)nullByte);
+    svuint64_t vRowNullByte = svld1ub_gather_u64(pg, vNullAddr);
+    svbool_t vRowIsNull = svcmpne_n_u64(
+        pg, svand_n_u64_x(pg, vRowNullByte, (uint64_t)nullMask), 0);
+
+    // ── Null comparison: XOR → null_match = NOT(row XOR decoded) ────────
+    // Key optimization: XOR instead of AND+OR+NOT chain
+    svbool_t vNullXor = sveor_b_z(pg, vRowIsNull, vDecodedIsNull);
+    svbool_t vNullMatch = svnot_b_z(pg, vNullXor);
+    svbool_t vBothNull = svand_b_z(pg, vRowIsNull, vDecodedIsNull);
+
+    // ── Row value gather & decoded values: type-specific handling ─────────
+    // SVE fast path for integer types: TINYINT, SMALLINT, INTEGER, BIGINT,
+    // BOOLEAN SVE fast path for floating point: DOUBLE REAL uses SVE-Mixed (SVE
+    // nulls + scalar value, SVE1 has no 64-bit gather for f32)
+
+    svbool_t vValueMatch;
+
+    if constexpr (Kind == TypeKind::TINYINT) {
+      // ── Row value gather (sign-extend int8 → int64) ────────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svint64_t vRowValues = svld1sb_gather_s64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load with sign-extension (sequential)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svint64_t vDecodedValues = svld1sb_s64(pg, decoded.data<int8_t>() + i);
+        // ── Value comparison ─────────────────────────────────────────────
+        vValueMatch = svcmpeq_s64(pg, vRowValues, vDecodedValues);
+      }
+    } else if constexpr (Kind == TypeKind::SMALLINT) {
+      // ── Row value gather (sign-extend int16 → int64) ───────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svint64_t vRowValues = svld1sh_gather_s64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load with sign-extension (sequential)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svint64_t vDecodedValues = svld1sh_s64(pg, decoded.data<int16_t>() + i);
+        // ── Value comparison ─────────────────────────────────────────────
+        vValueMatch = svcmpeq_s64(pg, vRowValues, vDecodedValues);
+      }
+    } else if constexpr (Kind == TypeKind::INTEGER) {
+      // ── Row value gather (sign-extend int32 → int64) ───────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svint64_t vRowValues = svld1sw_gather_s64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load with sign-extension (sequential)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svint64_t vDecodedValues = svld1sw_s64(pg, decoded.data<int32_t>() + i);
+        // ── Value comparison ─────────────────────────────────────────────
+        vValueMatch = svcmpeq_s64(pg, vRowValues, vDecodedValues);
+      }
+    } else if constexpr (Kind == TypeKind::BIGINT) {
+      // ── Row value gather (int64) ────────────────────────────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svint64_t vRowValues = svld1_gather_s64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load (sequential indices in partition)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svint64_t vDecodedValues = svld1_s64(pg, decoded.data<int64_t>() + i);
+        // ── Value comparison ─────────────────────────────────────────────
+        vValueMatch = svcmpeq_s64(pg, vRowValues, vDecodedValues);
+      }
+    } else if constexpr (Kind == TypeKind::DOUBLE) {
+      // ── Row value gather (float64) ──────────────────────────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svfloat64_t vRowValues = svld1_gather_f64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load (sequential indices in partition)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svfloat64_t vDecodedValues = svld1_f64(pg, decoded.data<double>() + i);
+        // ── Value comparison (ordered equality) ───────────────────────────
+        vValueMatch = svcmpeq_f64(pg, vRowValues, vDecodedValues);
+      }
+    } else if constexpr (Kind == TypeKind::BOOLEAN) {
+      // ── Row value gather (uint8, zero-extend → uint64) ─────────────────
+      svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, (uint64_t)offset);
+      svuint64_t vRowValues = svld1ub_gather_u64(pg, vValueAddr);
+
+      // ── Decoded values: contiguous load with zero-extension (sequential)
+      if constexpr (
+          Layout == DVecLayout::kIdentityNullable ||
+          Layout == DVecLayout::kIndexedNullableExtra) {
+        svuint64_t vDecodedValues =
+            svld1ub_u64(pg, decoded.data<uint8_t>() + i);
+        // ── Value comparison ─────────────────────────────────────────────
+        vValueMatch = svcmpeq_u64(pg, vRowValues, vDecodedValues);
+      }
+    } else {
+      // Fallback: scalar comparison for types without SVE value handling
+      // (TIMESTAMP, HUGEINT, complex types, etc.)
+      for (int32_t j = 0; j < activeCount; j++) {
+        auto idx = indices[i + j];
+        auto* curRow = rows[idx];
+        auto rowIsNull = RowContainer::isNullAt(curRow, nullByte, nullMask);
+        bool decodedIsNull = decoded.isNullAt(idx);
+        if (rowIsNull == decodedIsNull) {
+          if (!rowIsNull) {
+            if (!RowContainer::equalsNoNulls<Kind, Layout>(
+                    decoded, idx, curRow, offset, eqHelperStr)) {
+              std::swap(indices[i + j], indices[mismatchNum]);
+              mismatchNum++;
+            }
+          }
+        } else {
+          std::swap(indices[i + j], indices[mismatchNum]);
+          mismatchNum++;
+        }
+      }
+      i += activeCount;
+      continue;
+    }
+
+    if constexpr (
+        Layout != DVecLayout::kIdentityNullable &&
+        Layout != DVecLayout::kIndexedNullableExtra) {
+      // Fallback: scalar comparison for other layouts
+      for (int32_t j = 0; j < activeCount; j++) {
+        auto idx = indices[i + j];
+        auto* curRow = rows[idx];
+        auto rowIsNull = RowContainer::isNullAt(curRow, nullByte, nullMask);
+        bool decodedIsNull = decoded.isNullAt(idx);
+        if (rowIsNull == decodedIsNull) {
+          if (!rowIsNull) {
+            if (!RowContainer::equalsNoNulls<Kind, Layout>(
+                    decoded, idx, curRow, offset, eqHelperStr)) {
+              std::swap(indices[i + j], indices[mismatchNum]);
+              mismatchNum++;
+            }
+          }
+        } else {
+          std::swap(indices[i + j], indices[mismatchNum]);
+          mismatchNum++;
+        }
+      }
+      i += activeCount;
+      continue;
+    }
+
+    // ── Combine: match = null_match AND (both_null OR value_match) ──────
+    svbool_t vMatch =
+        svand_b_z(pg, vNullMatch, svorr_b_z(pg, vBothNull, vValueMatch));
+
+    // ── Mismatch handling ───────────────────────────────────────────────
+    if (!svptest_any(pg, svnot_b_z(pg, vMatch))) {
+      // All match — skip mismatch extraction entirely (fast path)
+      i += activeCount;
+      continue;
+    }
+
+    // Some mismatches: extract match flags and do scalar swaps
+    svuint64_t vMatchFlag = svsel_u64(vMatch, svdup_n_u64(1), svdup_n_u64(0));
+    uint64_t matchFlags[32]; // max 2048-bit SVE = 32 × uint64
+    svst1_u64(pg, matchFlags, vMatchFlag);
+
+    for (int32_t j = 0; j < activeCount; j++) {
+      if (matchFlags[j] == 0) {
+        std::swap(indices[i + j], indices[mismatchNum]);
+        mismatchNum++;
+      }
+    }
+
+    i += activeCount;
+  }
+}
+#endif
+
+template <TypeKind Kind, DecodedVector::Layout Layout>
+void batchEqualsWithNulls(
+    char** rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices,
+    int32_t& mismatchNum) {
+#ifdef __ARM_FEATURE_SVE
+  if constexpr (
+      Layout == DVecLayout::kIdentityNullable ||
+      Layout == DVecLayout::kIndexedNullableExtra) {
+    if constexpr (
+        Kind == TypeKind::BOOLEAN || Kind == TypeKind::TINYINT ||
+        Kind == TypeKind::SMALLINT || Kind == TypeKind::INTEGER ||
+        Kind == TypeKind::BIGINT || Kind == TypeKind::DOUBLE) {
+      // SVE-Full mode for primitive types with SVE value comparison
+      vBatchEquals<Kind, Layout>(rows, column, decoded, indices, mismatchNum);
+      return;
+    }
+  }
+#endif
+
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  auto offset = column.offset();
+  auto nullByte = column.nullByte();
+  auto nullMask = column.nullMask();
+  std::string eqHelperStr;
+
+  for (int32_t i = mismatchNum; i < indices.size(); i++) {
+    auto idx = indices[i];
+    auto* curRow = rows[idx];
+    auto eq = RowContainer::equalsWithNulls<Kind, Layout>(
+        decoded, idx, curRow, offset, nullByte, nullMask, eqHelperStr);
+    if (UNLIKELY(!eq)) {
+      std::swap(indices[i], indices[mismatchNum]);
+      mismatchNum++;
+    }
+  }
+}
+
+template <TypeKind Kind, DecodedVector::Layout Layout>
+void batchEqualsNoNulls(
+    char** rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices,
+    int32_t& mismatchNum) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  auto offset = column.offset();
+  std::string eqHelperStr;
+
+  for (int32_t i = mismatchNum; i < indices.size(); i++) {
+    auto idx = indices[i];
+    auto* curRow = rows[idx];
+    auto eq = RowContainer::equalsNoNulls<Kind, Layout>(
+        decoded, idx, curRow, offset, eqHelperStr);
+    if (UNLIKELY(!eq)) {
+      std::swap(indices[i], indices[mismatchNum]);
+      mismatchNum++;
+    }
+  }
+}
+
+template <TypeKind Kind>
+constexpr uint32_t kindSize() {
+  return sizeof(typename KindToFlatVector<Kind>::HashRowType);
+}
+
+template <TypeKind Kind, bool ignoreNullKeys, typename legacy = void>
+void batchEqualsHelper(
+    char** rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices,
+    int32_t& mismatchNum) {
+  // For floating point, Nan == Nan will be false.
+  // We can compare them with integer instead
+  if constexpr (Kind == TypeKind::REAL) {
+    static_assert(kindSize<Kind>() == kindSize<TypeKind::INTEGER>());
+    batchEqualsHelper<TypeKind::INTEGER, ignoreNullKeys>(
+        rows, column, decoded, indices, mismatchNum);
+    return;
+  } else if constexpr (Kind == TypeKind::DOUBLE) {
+    static_assert(kindSize<Kind>() == kindSize<TypeKind::BIGINT>());
+    batchEqualsHelper<TypeKind::BIGINT, ignoreNullKeys>(
+        rows, column, decoded, indices, mismatchNum);
+    return;
+  }
+
+  switch (decoded.getLayout()) {
+#define DISPATCH(LAYOUT)                                \
+  case LAYOUT:                                          \
+    if constexpr (ignoreNullKeys) {                     \
+      return batchEqualsNoNulls<Kind, LAYOUT>(          \
+          rows, column, decoded, indices, mismatchNum); \
+    } else {                                            \
+      return batchEqualsWithNulls<Kind, LAYOUT>(        \
+          rows, column, decoded, indices, mismatchNum); \
+    }
+    FOREACH_VALID_LAYOUT(DISPATCH)
+#undef DISPATCH
+    default:
+      BOLT_FAIL("unsupported layout");
+  }
+}
+
+template <TypeKind Kind, bool ignoreNullKeys, DVecLayout Layout>
+void batchStore(
+    RowContainer& rowContainer,
+    const std::vector<char*>& rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices) {
+  auto offset = column.offset();
+  auto nullByte = column.nullByte();
+  auto nullMask = column.nullMask();
+
+  for (auto idx : indices) {
+    auto* curRow = rows[idx];
+    if (ignoreNullKeys) {
+      rowContainer.storeNoNulls<Kind, Layout>(
+          decoded, idx, true, curRow, offset);
+    } else {
+      rowContainer.storeWithNulls<Kind, Layout>(
+          decoded, idx, true, curRow, offset, nullByte, nullMask);
+    }
+  }
+}
+
+template <TypeKind Kind, bool ignoreNullKeys, typename legacy = void>
+void batchStoreHelper(
+    DVecLayout layout,
+    RowContainer& rowContainer,
+    const std::vector<char*>& rows,
+    RowColumn column,
+    const DecodedVector& decoded,
+    std::vector<vector_size_t>& indices) {
+  switch (layout) {
+#define DISPATCH(LAYOUT)                             \
+  case LAYOUT:                                       \
+    return batchStore<Kind, ignoreNullKeys, LAYOUT>( \
+        rowContainer, rows, column, decoded, indices);
+    FOREACH_VALID_LAYOUT(DISPATCH)
+#undef DISPATCH
+    default:
+      BOLT_FAIL("unsupported layout");
+  }
+}
+
+} // namespace
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::groupTaperKeyProbe(HashLookup& lookup) {
+  auto* table = taperTableWrapper_.toScattered();
+  BOLT_CHECK_NOT_NULL(table);
+
+  auto numHashers = hashers_.size();
+  auto initRow = [&](uint32_t rowIdx, char* data) {
+    auto* row = rows_->newRow();
+    pointerAt(data) = row;
+    ++numDistinct_;
+    lookup.newGroups.push_back(rowIdx);
+    return row;
+  };
+  auto storeKeys = [&](uint32_t rowIdx, char* row) {
+    for (int i = 0; i < numHashers; ++i) {
+      rows_->store(hashers_[i]->decodedVector(), rowIdx, row, i);
+    }
+  };
+
+  workingUpdateIndices_.clear();
+  table->emplaceBatch(
+      lookup.hashes.data(),
+      lookup.hashes.size(),
+      [&](uint32_t) { return false; },
+      [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
+      [&](uint32_t rowIdx, char* data, bool isInit) {
+        lookup.hits[rowIdx] = pointerAt(data);
+        if (!isInit) {
+          // rows with duplicated hashes (except first row of same hashes)
+          workingUpdateIndices_.push_back(rowIdx);
+        }
+      });
+
+  for (size_t i = 0; i < hashers_.size(); i++) {
+    auto& decoded = hashers_[i]->decodedVector();
+    BOLT_DYNAMIC_TEMPLATE_TYPE_DISPATCH(
+        batchStoreHelper,
+        decoded.base()->typeKind(),
+        ignoreNullKeys,
+        void,
+        decoded.getLayout(),
+        *rows_,
+        lookup.hits,
+        rows_->columnAt(i),
+        decoded,
+        lookup.newGroups);
+  }
+
+  if (workingUpdateIndices_.empty()) {
+    return;
+  }
+  int32_t mismatchNum = 0;
+  for (int i = 0; i < numHashers; ++i) {
+    DecodedVector& decoded = hashers_[i]->decodedVector();
+    BOLT_DYNAMIC_TEMPLATE_TYPE_DISPATCH(
+        batchEqualsHelper,
+        decoded.base()->typeKind(),
+        ignoreNullKeys,
+        void,
+        lookup.hits.data(),
+        rows_->columnAt(i),
+        decoded,
+        workingUpdateIndices_,
+        mismatchNum);
+  }
+  for (int i = 0; i < mismatchNum; ++i) {
+    auto rowIdx = workingUpdateIndices_[i];
+    table->emplace(
+        lookup.hashes[rowIdx],
+        [&](auto, TaperHashTableChunk& chunk, uint8_t slot) {
+          auto* row = pointerAt(table->chunkVal(chunk, slot));
+          return compareKeys(row, lookup, rowIdx);
+        },
+        [&](char* data) {
+          auto* row = initRow(rowIdx, data);
+          storeKeys(rowIdx, row);
+        },
+        [&](char* data, bool) { lookup.hits[rowIdx] = pointerAt(data); });
+  }
+}
+
+template <>
+template <DVecLayout AggLayout, typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbeConstKey(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  // For flat table, we should expand before batch emplace to avoid pointer
+  // invalidation during expansion.
+  auto numRows = lookup.rows.size();
+  auto* hasher = lookup.hashers[0].get();
+
+  // concrete type for BIGINT key and  SumAggregateBase<double, double, double>
+  using KeyType = int64_t;
+
+  auto& decoded = hasher->decodedVector();
+  auto keyIsNull = decoded.isNullAt(0);
+  KeyType keyValue = keyIsNull ? 0 : decoded.valueAt<KeyType>(0);
+
+  // emplaceFlat is called once per batch,
+  // performance impact from variant dispatch is tiny.
+  char* row = nullptr;
+  taperTableWrapper_.emplaceFlat(
+      keyValue,
+      keyIsNull,
+      rows_->columnAt(0),
+      [&](char* data) INLINE_LAMBDA {
+        // skip populating lookup->newGroups as agg-init already done here.
+        rows_->initializeRow(data, false);
+        aggregate.initializeNewGroup(data);
+        ++numDistinct_;
+      },
+      [&](char* data, bool) INLINE_LAMBDA {
+        // skip populating lookup->hits as agg-update already done here.
+        aggregate.template updateGroup<AggLayout>(aggVector, data, 0);
+        row = data;
+      });
+
+  BOLT_CHECK_NOT_NULL(row);
+
+  // skip populating lookup->hits as agg-update already done here.
+  for (vector_size_t rowIdx = 1; rowIdx < numRows; rowIdx++) {
+    aggregate.template updateGroup<AggLayout>(aggVector, row, rowIdx);
+  }
+}
+
+template <>
+template <DVecLayout KeyLayout, typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbeConstAgg(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  // For flat table, we should expand before batch emplace to avoid pointer
+  // invalidation during expansion.
+  auto numRows = lookup.rows.size();
+  auto* hasher = lookup.hashers[0].get();
+
+  // concrete type for BIGINT key and  SumAggregateBase<double, double, double>
+  using AggType = double;
+
+  auto aggIsNull = aggVector.isNullAt(0);
+  AggType aggValue = aggIsNull ? 0 : aggVector.valueAt<AggType>(0);
+
+  taperTableWrapper_.template emplaceBatchFlat<KeyLayout>(
+      *hasher,
+      rows_->columnAt(0),
+      numRows,
+      [&](uint32_t, char* data) INLINE_LAMBDA {
+        // skip populating lookup->newGroups as agg-init already done here.
+        rows_->initializeRow(data, false);
+        aggregate.initializeNewGroup(data);
+        ++numDistinct_;
+      },
+      [&](uint32_t, char* data, bool) INLINE_LAMBDA {
+        // pushdown is not supported here yet.
+        // no need to update lookup->hits as aggregate already done here.
+        if (!aggIsNull) {
+          aggregate.updateGroup(aggValue, data);
+        }
+      });
+}
+
+template <>
+template <typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbeConstKeyConstAgg(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  // For flat table, we should expand before batch emplace to avoid pointer
+  // invalidation during expansion.
+  auto numRows = lookup.rows.size();
+  auto* hasher = lookup.hashers[0].get();
+
+  // concrete type for BIGINT key and  SumAggregateBase<double, double, double>
+  using KeyType = int64_t;
+  using AggType = double;
+
+  auto& decoded = hasher->decodedVector();
+
+  auto keyIsNull = decoded.isNullAt(0);
+  KeyType keyValue = keyIsNull ? 0 : decoded.valueAt<KeyType>(0);
+  auto aggIsNull = aggVector.isNullAt(0);
+  AggType aggValue = aggIsNull ? 0 : aggVector.valueAt<AggType>(0);
+
+  // emplaceFlat is called once per batch,
+  // performance impact from variant dispatch is tiny.
+  char* row = nullptr;
+  taperTableWrapper_.emplaceFlat(
+      keyValue,
+      keyIsNull,
+      rows_->columnAt(0),
+      [&](char* data) INLINE_LAMBDA {
+        // skip populating lookup->newGroups as agg-init already done here.
+        rows_->initializeRow(data, false);
+        aggregate.initializeNewGroup(data);
+        ++numDistinct_;
+      },
+      [&](char* data, bool) INLINE_LAMBDA {
+        // no need to update lookup->hits as aggregate already done here.
+        if (!aggIsNull) {
+          aggregate.updateGroup(aggValue, data);
+        }
+        row = data;
+      });
+
+  BOLT_CHECK_NOT_NULL(row);
+
+  // no need to update lookup->hits as aggregate already done here.
+  if (!aggIsNull) {
+    for (vector_size_t rowIdx = 1; rowIdx < numRows; rowIdx++) {
+      aggregate.updateGroup(aggValue, row);
+    }
+  }
+}
+
+template <>
+template <DVecLayout KeyLayout, DVecLayout AggLayout, typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbe(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  constexpr auto kKeyIsConst = KeyLayout == DecodedVector::Layout::kConst ||
+      KeyLayout == DecodedVector::Layout::kConstNull;
+  constexpr auto kAggIsConst = AggLayout == DecodedVector::Layout::kConst ||
+      AggLayout == DecodedVector::Layout::kConstNull;
+  if constexpr (kKeyIsConst && kAggIsConst) {
+    groupTaperFlatProbeConstKeyConstAgg(lookup, aggregate, aggVector);
+    return;
+  }
+  if constexpr (kKeyIsConst) {
+    groupTaperFlatProbeConstKey<AggLayout>(lookup, aggregate, aggVector);
+    return;
+  }
+  if constexpr (kAggIsConst) {
+    groupTaperFlatProbeConstAgg<KeyLayout>(lookup, aggregate, aggVector);
+    return;
+  }
+
+  // For flat table, we should expand before batch emplace to avoid pointer
+  // invalidation during expansion.
+  auto numRows = lookup.rows.size();
+  auto* hasher = lookup.hashers[0].get();
+
+  taperTableWrapper_.template emplaceBatchFlat<KeyLayout>(
+      *hasher,
+      rows_->columnAt(0),
+      numRows,
+      [&](uint32_t, char* data) INLINE_LAMBDA {
+        // skip populating lookup->newGroups as agg-init already done here.
+        rows_->initializeRow(data, false);
+        aggregate.initializeNewGroup(data);
+        ++numDistinct_;
+      },
+      [&](uint32_t rowIdx, char* data, bool) INLINE_LAMBDA {
+        // pushdown is not supported here yet.
+        // no need to update lookup->hits as aggregate already done here.
+        aggregate.template updateGroup<AggLayout>(aggVector, data, rowIdx);
+      });
+}
+
+template <>
+template <DVecLayout KeyLayout, typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbe(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  auto accLayout = aggVector.getLayout();
+#define DISPATCH(...)                                            \
+  if (__VA_ARGS__ == accLayout) {                                \
+    groupTaperFlatProbe<KeyLayout, __VA_ARGS__, AggregateClass>( \
+        lookup, aggregate, aggVector);                           \
+    return;                                                      \
+  }
+
+  FOREACH_VALID_LAYOUT(DISPATCH)
+#undef DISPATCH
+
+  groupTaperFlatProbe<KeyLayout, DVecLayout::kUnknown, AggregateClass>(
+      lookup, aggregate, aggVector);
+}
+
+template <>
+template <typename AggregateClass>
+void HashTable<false>::groupTaperFlatProbe(
+    HashLookup& lookup,
+    AggregateClass& aggregate,
+    DecodedVector& aggVector) {
+  auto keyLayout = lookup.hashers[0]->decodedVector().getLayout();
+#define DISPATCH(...)                                 \
+  if (__VA_ARGS__ == keyLayout) {                     \
+    groupTaperFlatProbe<__VA_ARGS__, AggregateClass>( \
+        lookup, aggregate, aggVector);                \
+    return;                                           \
+  }
+
+  FOREACH_VALID_LAYOUT(DISPATCH)
+#undef DISPATCH
+
+  groupTaperFlatProbe<DVecLayout::kUnknown, AggregateClass>(
+      lookup, aggregate, aggVector);
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::groupProbe(
+    HashLookup& lookup,
+    AggregateInfo& aggregate,
+    const std::vector<VectorPtr>& aggVectors,
+    const SelectivityVector& aggRows,
+    bool) {
+  if constexpr (ignoreNullKeys) {
+    BOLT_UNREACHABLE("Taper flat not support ignoreNullkeys");
+    return;
+  }
+  BOLT_CHECK_EQ(hashMode_, HashMode::kTaperFlat);
+  BOLT_CHECK_EQ(aggVectors.size(), 1, "Taper flat only supports single vector");
+
+  auto numHashers = lookup.hashers.size();
+  BOLT_CHECK_EQ(numHashers, 1, "Taper flat only supports single hasher");
+
+  // ensure taper table is initialized before probe.
+  if (!taperTableWrapper_) {
+    checkSize(lookup.rows.size(), false);
+  }
+
+  aggVector_.decode(*aggVectors[0], aggRows);
+
+  std::visit(
+      bolt::Overload{
+          [&](std::monostate&) {
+            BOLT_UNSUPPORTED(
+                "Other aggregate functions are not supported here.");
+          },
+          [&](auto& aggFuncRef) {
+            using AggregateType = std::decay_t<decltype(aggFuncRef.get())>;
+
+    // clang-format off
+#define DISPATCH(...)                                                    \
+            if constexpr (std::is_same_v<__VA_ARGS__, AggregateType>) {  \
+              groupTaperFlatProbe(lookup, aggFuncRef.get(), aggVector_); \
+              return;                                                    \
+            }
+            // clang-format on
+
+            FOREACH_FLAT_COMPATIBLE_AGGREGATE_CLASS(DISPATCH)
+#undef DISPATCH
+
+            BOLT_UNSUPPORTED(
+                "Other aggregate functions are not supported here.");
+          }},
+      aggregate.rowBasedAggVars.vars);
+}
+
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeJoinProbeCalls);
   incrementProbes(lookup.rows.size());
   if (hashMode_ == HashMode::kArray) {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeJoinProbeArrayCalls);
     arrayJoinProbe(lookup);
     return;
   }
+  if (hashMode_ == HashMode::kTaperHash) {
+    joinTaperKeyProbe(lookup);
+    return;
+  }
   if (hashMode_ == HashMode::kNormalizedKey) {
+    DEBUG_STAT_TLS_RECORD_SCOPE(
+        debug::DebugStat::ProbeJoinProbeNormalizedCalls);
     populateNormalizedKeys(lookup, sizeBits_);
     if (simdNormalizedKeyLayoutActive()) {
       joinNormalizedKeyProbeSimd(lookup);
@@ -724,6 +1580,7 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
     joinHashProbeSimd(lookup);
     return;
   }
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeJoinProbeHashCalls);
   int32_t probeIndex = 0;
   int32_t numProbes = lookup.rows.size();
   const vector_size_t* rows = lookup.rows.data();
@@ -850,6 +1707,90 @@ void HashTable<ignoreNullKeys>::arrayJoinProbe(HashLookup& lookup) {
 }
 
 template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::joinTaperKeyProbe(HashLookup& lookup) {
+  auto numHashers = lookup.hashers.size();
+
+  MemoryView<int> workingUpdateIndices{
+      alloca(sizeof(int) * lookup.rows.size())};
+
+  auto* table = taperTableWrapper_.toScattered();
+  BOLT_CHECK_NOT_NULL(table);
+
+  table->probeBatch(
+      lookup.hashes.data(),
+      lookup.rows.data(),
+      lookup.rows.size(),
+      [&](uint32_t) { return false; },
+      [&](uint32_t idx, char*) {
+        auto rowIdx = lookup.rows[idx];
+        lookup.hits[rowIdx] = nullptr;
+      },
+      [&](uint32_t idx, char* data) {
+        // rows with duplicated hashes (except first row of same hashes)
+        auto rowIdx = lookup.rows[idx];
+        lookup.hits[rowIdx] = pointerAt(data);
+        workingUpdateIndices.push_back(rowIdx);
+      });
+
+  if (workingUpdateIndices.empty()) {
+    return;
+  }
+  int32_t mismatchNum = 0;
+  for (int i = 0; i < workingUpdateIndices.size(); ++i) {
+    auto rowIdx = workingUpdateIndices[i];
+    if (!compareKeys(lookup.hits[rowIdx], lookup, rowIdx)) {
+      std::swap(workingUpdateIndices[i], workingUpdateIndices[mismatchNum]);
+      ++mismatchNum;
+    }
+  }
+
+  for (int i = 0; i < mismatchNum; ++i) {
+    auto rowIdx = workingUpdateIndices[i];
+    table->probe(
+        lookup.hashes[rowIdx],
+        [&](auto, TaperHashTableChunk& chunk, uint8_t slot) {
+          auto* row = pointerAt(table->chunkVal(chunk, slot));
+          return compareKeys(row, lookup, rowIdx);
+        },
+        [&](char*) { lookup.hits[rowIdx] = nullptr; },
+        [&](char* data) { lookup.hits[rowIdx] = pointerAt(data); });
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::probeSingleEntry(
+    ProbeState& probeState,
+    const uint64_t* keys,
+    char** hits,
+    std::vector<ProbeCollisionEntry>& collisionQueue) {
+  constexpr int32_t kKeyOffset =
+      -static_cast<int32_t>(sizeof(normalized_key_t));
+  const auto kEmptyGroup =
+    BaseHashTable::TagVector::broadcast(ProbeState::kEmptyTag);
+
+  if (probeState.group() &&
+      RowContainer::normalizedKey(probeState.group()) == keys[probeState.row()]) {
+    incrementHits();
+    hits[probeState.row()] = probeState.group();
+    return;
+  }
+  while (probeState.hits()) {
+    probeState.loadNextHit<ProbeState::Operation::kProbe>(*this, kKeyOffset);
+    if (RowContainer::normalizedKey(probeState.group()) == keys[probeState.row()]) {
+      incrementHits();
+      hits[probeState.row()] = probeState.group();
+      return;
+    }
+  }
+  if (simd::toBitMask(probeState.tagsInTable() == kEmptyGroup)) {
+    hits[probeState.row()] = nullptr;
+  } else {
+    collisionQueue.push_back(
+        {probeState.bucketOffset(), probeState.wantedTags(), probeState.row()});
+  }
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
   int32_t probeIndex = 0;
   int32_t numProbes = lookup.rows.size();
@@ -860,24 +1801,28 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
   char** hits = lookup.hits.data();
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
+  std::vector<ProbeCollisionEntry> collisionQueue;
+
   for (; probeIndex + kPrefetchSize <= numProbes; probeIndex += kPrefetchSize) {
-    for (int32_t i = 0; i < kPrefetchSize; ++i) {
-      int32_t row = rows[probeIndex + i];
-      states[i].preProbe(*this, hashes[row], row);
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      int32_t row = rows[probeIndex + batchIdx];
+      states[batchIdx].preProbe(*this, hashes[row], row);
     }
-    for (int32_t i = 0; i < kPrefetchSize; ++i) {
-      states[i].firstProbe(*this, kKeyOffset);
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      states[batchIdx].firstProbe(*this, kKeyOffset);
     }
-    for (int32_t i = 0; i < kPrefetchSize; ++i) {
-      hits[states[i].row()] = states[i].joinNormalizedKeyFullProbe(*this, keys);
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      probeSingleEntry(states[batchIdx], keys, hits, collisionQueue);
     }
   }
   for (; probeIndex < numProbes; ++probeIndex) {
     int32_t row = rows[probeIndex];
     states[0].preProbe(*this, lookup.hashes[row], row);
     states[0].firstProbe(*this, 0);
-    hits[row] = states[0].joinNormalizedKeyFullProbe(*this, keys);
+    probeSingleEntry(states[0], keys, hits, collisionQueue);
   }
+
+  processProbeCollisions(collisionQueue, states, keys, hits);
 }
 
 template <bool ignoreNullKeys>
@@ -927,6 +1872,12 @@ void HashTable<ignoreNullKeys>::clear(bool freeTable) {
       memset(table_, 0, capacity_ * sizeof(char*));
     }
   }
+  if (taperTableWrapper_.initialized()) {
+    taperTableWrapper_.clear();
+    if (freeTable) {
+      taperTableWrapper_.reset();
+    }
+  }
   numDistinct_ = 0;
   numTombstones_ = 0;
   numProbeInputs_ = 0;
@@ -955,7 +1906,42 @@ void HashTable<ignoreNullKeys>::checkSize(
       allocateTables(size);
     }
   };
-  if (table_ == nullptr || capacity_ == 0) {
+  if (isTaperMode(hashMode_)) {
+    // taper table should be initialized where, but no rehash is required here.
+    if (!taperTableWrapper_) {
+      if (isTaperFlatMode(hashMode_)) {
+        taperTableWrapper_.initFlat(
+            hashers_.front()->type(),
+            rows_->fixedRowSize(),
+            *rows_->pool(),
+            newNumDistincts);
+      } else {
+        taperTableWrapper_.initScattered(*rows_->pool(), newNumDistincts);
+      }
+
+      // free table allocation as it wont be used anymore
+      if (table_ != nullptr) {
+        rows_->pool()->freeContiguous(tableAllocation_);
+        table_ = nullptr;
+        capacity_ = 0;
+      }
+
+      capacity_ = taperTableWrapper_.capacity();
+      sizeMask_ = taperTableWrapper_.allocatedBytes() - 1;
+      sizeBits_ = static_cast<int8_t>(
+          63 - bits::countLeadingZeros(static_cast<uint64_t>(capacity_)));
+
+      // rehash only if taper table is not used and table is not empty.
+      if (numDistinct_ > 0) {
+        rehash(initNormalizedKeys);
+
+        // in flat mode, rows are no longer store in row container.
+        if (hashMode_ == HashMode::kTaperFlat) {
+          rows_->clear();
+        }
+      }
+    }
+  } else if (table_ == nullptr || capacity_ == 0) {
     const auto newSize = newHashTableEntries(numDistinct_, numNew);
     allocate(newSize);
     if (numDistinct_ > 0) {
@@ -989,7 +1975,8 @@ bool HashTable<ignoreNullKeys>::hashRows(
     return true;
   }
   const bool useSimd = simdActive();
-  if (!initNormalizedKeys && hashMode_ == HashMode::kNormalizedKey) {
+  if (!initNormalizedKeys &&
+      hashMode_ == HashMode::kNormalizedKey) {
     if (useSimd) {
       hash_table_simd::rehashNormalizedKeys(
           rows.data(), rows.size(), hashes.data());
@@ -1004,7 +1991,7 @@ bool HashTable<ignoreNullKeys>::hashRows(
 
   for (int32_t i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];
-    if (hashMode_ == HashMode::kHash) {
+    if (hashMode_ == HashMode::kHash || hashMode_ == HashMode::kTaperHash) {
       const auto column = rows_->columnAt(i);
       const auto nullByte = column.nullByte();
       const uint8_t nullMask = column.nullMask();
@@ -1039,7 +2026,8 @@ bool HashTable<ignoreNullKeys>::hashRows(
       }
     }
   }
-  if (hashMode_ == HashMode::kNormalizedKey && initNormalizedKeys) {
+  if (hashMode_ == HashMode::kNormalizedKey &&
+      initNormalizedKeys) {
     for (auto i = 0; i < rows.size(); ++i) {
       RowContainer::normalizedKey(rows[i]) = hashes[i];
     }
@@ -1239,6 +2227,7 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::partitionRows(
     HashTable<ignoreNullKeys>& subtable,
     RowPartitions& rowPartitions) {
+  BOLT_CHECK_NE(subtable.hashMode(), HashMode::kTaperFlat);
   constexpr int32_t kBatch = 1024;
   raw_vector<char*> rows(kBatch);
   raw_vector<uint64_t> hashes(kBatch);
@@ -1279,6 +2268,7 @@ void HashTable<ignoreNullKeys>::buildJoinPartition(
   std::vector<hash_table_simd::KeyColumn> keyColumns;
   for (auto i = 0; i < numPartitions; ++i) {
     auto* table = i == 0 ? this : otherTables_[i - 1].get();
+    BOLT_CHECK_NE(table->hashMode(), HashMode::kTaperFlat);
     RowContainerIterator iter;
     while (const auto numRows = table->rows_->listPartitionRows(
                iter, partition, kBatch, *rowPartitions[i], rows.data())) {
@@ -1301,15 +2291,115 @@ bool HashTable<ignoreNullKeys>::insertBatch(
     int32_t numGroups,
     raw_vector<uint64_t>& hashes,
     bool initNormalizedKeys) {
-  if (!hashRows(folly::Range(groups, numGroups), initNormalizedKeys, hashes)) {
-    return false;
+  if (!isJoinBuild_) {
+    if (hashMode_ == HashMode::kTaperHash) {
+      insertTaperKeyGroup(groups, numGroups, hashes);
+      return true;
+    }
+    if (hashMode_ == HashMode::kTaperFlat) {
+      insertTaperFlatGroup(groups, numGroups);
+      return true;
+    }
   }
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::hashRows);
+    if (!hashRows(
+            folly::Range(groups, numGroups), initNormalizedKeys, hashes)) {
+      return false;
+    }
+  }
+
   if (isJoinBuild_) {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::InsertJoin);
     insertForJoin(groups, hashes.data(), numGroups, nullptr);
   } else {
     insertForGroupBy(groups, hashes.data(), numGroups);
   }
   return true;
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::insertTaperKeyGroup(
+    char** groups,
+    int32_t numGroups,
+    raw_vector<uint64_t>& hashes) {
+  auto* table = taperTableWrapper_.toScattered();
+  BOLT_CHECK_NOT_NULL(table);
+
+  auto numHashers = hashers_.size();
+
+  auto range = folly::Range(groups, numGroups);
+  for (int32_t i = 0; i < numHashers; ++i) {
+    auto& hasher = hashers_[i];
+    rows_->hash(i, range, i > 0, hashes.data());
+  }
+
+  // row is already inited before rehash, we can simply copy pointer to table.
+  auto initRow = [&](uint32_t rowIdx, char* data) {
+    pointerAt(data) = groups[rowIdx];
+  };
+
+  workingUpdateIndices_.clear();
+  workingUpdateRows_.clear();
+  table->emplaceBatch(
+      hashes.data(),
+      numGroups,
+      [&](uint32_t) { return false; },
+      [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
+      [&](uint32_t rowIdx, char* data, bool isInit) {
+        if (!isInit) {
+          workingUpdateIndices_.push_back(rowIdx);
+          workingUpdateRows_.push_back(pointerAt(data));
+        }
+      });
+  if (workingUpdateIndices_.empty()) {
+    return;
+  }
+
+  int32_t mismatchNum = 0;
+  for (int32_t i = 0; i < workingUpdateIndices_.size(); i++) {
+    auto* group = groups[workingUpdateIndices_[i]];
+    auto* inserted = workingUpdateRows_[i];
+    if (UNLIKELY(!compareKeys(group, inserted))) {
+      // workingUpdateRows_ is not updated here, because it wont be used in next
+      // loops or after the whole loop
+      std::swap(workingUpdateIndices_[i], workingUpdateIndices_[mismatchNum]);
+      mismatchNum++;
+    }
+  }
+  // workingUpdateRows_ is matching with workingUpdateIndices_ now, just clear
+  // it to avoid confusion.
+  workingUpdateRows_.clear();
+
+  for (int i = 0; i < mismatchNum; ++i) {
+    auto rowIdx = workingUpdateIndices_[i];
+    table->emplace(
+        hashes[rowIdx],
+        [&](auto, TaperHashTableChunk& chunk, uint8_t slot) {
+          auto* row = pointerAt(table->chunkVal(chunk, slot));
+          return compareKeys(row, groups[rowIdx]);
+        },
+        [&](char* data) { initRow(rowIdx, data); },
+        [&](char* data, bool) {});
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::insertTaperFlatGroup(
+    char** groups,
+    int32_t numGroups) {
+  auto keySize = rows_->keyTypes()[0]->cppSizeInBytes();
+  auto valSize = rows_->fixedRowSize() - keySize;
+  auto initRow = [&](uint32_t rowIdx, char* data) {
+    simd::memcpy(data + keySize, groups[rowIdx] + keySize, valSize);
+  };
+
+  taperTableWrapper_.emplaceBatchFlat(
+      rows_->columnAt(0),
+      groups,
+      numGroups,
+      [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
+      [&](uint32_t rowIdx, char*, bool isInit) {});
 }
 
 template <bool ignoreNullKeys>
@@ -1392,6 +2482,12 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
 }
 
 template <bool ignoreNullKeys>
+TaperFlatHashTableWrapper::FlatRowContainer*
+HashTable<ignoreNullKeys>::flatRows() {
+  return &taperTableWrapper_.toFlatRows();
+}
+
+template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::arrayPushRow(char* row, int32_t index) {
   auto existing = table_[index];
   if (nextOffset_) {
@@ -1408,6 +2504,72 @@ bool HashTable<ignoreNullKeys>::arrayPushRow(char* row, int32_t index) {
 }
 
 template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::insertForJoinInTaperKey(
+    char** groups,
+    uint64_t* hashes,
+    int32_t numGroups,
+    TableInsertPartitionInfo* partitionInfo) {
+  auto* table = taperTableWrapper_.toScattered();
+  BOLT_CHECK_NOT_NULL(table);
+
+  auto numHashers = hashers_.size();
+  // row is already inited before rehash, we can simply copy pointer to table.
+  auto initRow = [&](uint32_t rowIdx, char* data) {
+    pointerAt(data) = groups[rowIdx];
+  };
+
+  workingUpdateIndices_.clear();
+  workingUpdateRows_.clear();
+  table->emplaceBatch(
+      hashes,
+      numGroups,
+      [&](uint32_t) { return false; },
+      [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
+      [&](uint32_t rowIdx, char* data, bool isInit) {
+        if (!isInit) {
+          workingUpdateIndices_.push_back(rowIdx);
+          workingUpdateRows_.push_back(pointerAt(data));
+        }
+      });
+
+  if (workingUpdateIndices_.empty()) {
+    return;
+  }
+
+  int32_t unequalNum = 0;
+  for (int i = 0; i < workingUpdateIndices_.size(); ++i) {
+    auto rowIdx = workingUpdateIndices_[i];
+    if (!compareKeys(workingUpdateRows_[i], groups[rowIdx])) {
+      std::swap(workingUpdateIndices_[i], workingUpdateIndices_[unequalNum]);
+      std::swap(workingUpdateRows_[i], workingUpdateRows_[unequalNum]);
+      ++unequalNum;
+    }
+  }
+
+  for (int i = 0; i < unequalNum; ++i) {
+    auto rowIdx = workingUpdateIndices_[i];
+    table->emplace(
+        hashes[rowIdx],
+        [&](auto, TaperHashTableChunk& chunk, uint8_t slot) {
+          auto* row = pointerAt(table->chunkVal(chunk, slot));
+          return compareKeys(row, groups[rowIdx]);
+        },
+        [&](char* data) { initRow(rowIdx, data); },
+        [&](char* data, bool isInit) {
+          if (!isInit && nextOffset_ > 0) {
+            pushNext(pointerAt(data), groups[rowIdx]);
+          }
+        });
+  }
+
+  if (nextOffset_ > 0) {
+    for (int i = unequalNum; i < workingUpdateIndices_.size(); ++i) {
+      pushNext(workingUpdateRows_[i], groups[workingUpdateIndices_[i]]);
+    }
+  }
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::pushNext(char* row, char* next) {
   BOLT_CHECK_GT(nextOffset_, 0);
   hasDuplicates_.set();
@@ -1417,7 +2579,7 @@ void HashTable<ignoreNullKeys>::pushNext(char* row, char* next) {
 }
 
 template <bool ignoreNullKeys>
-template <bool isNormailizedKeyMode>
+template <bool isNormalizedKeyMode>
 FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::buildFullProbe(
     ProbeState& state,
     uint64_t hash,
@@ -1434,7 +2596,7 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::buildFullProbe(
     storeRowPointer(index, hash, inserted);
     return nullptr;
   };
-  if constexpr (isNormailizedKeyMode) {
+  if constexpr (isNormalizedKeyMode) {
     state.fullProbe<ProbeState::Operation::kInsert>(
         *this,
         kKeyOffset,
@@ -1473,39 +2635,427 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::buildFullProbe(
 }
 
 template <bool ignoreNullKeys>
-template <bool isNormailizedKeyMode>
+bool HashTable<ignoreNullKeys>::rowKeysMatch(
+    char* lhs, char* rhs, bool useNormalizedKey) {
+  if (useNormalizedKey) {
+    return RowContainer::normalizedKey(lhs) ==
+           RowContainer::normalizedKey(rhs);
+  }
+  return compareKeys(lhs, rhs);
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
+bool HashTable<ignoreNullKeys>::tryInsertOne(
+    ProbeState& probeState,
+    char* row,
+    uint64_t hash,
+    char* skipGroup,
+    TableInsertPartitionInfo* partitionInfo) {
+  constexpr int32_t kKeyOffset =
+      -static_cast<int32_t>(sizeof(normalized_key_t));
+  int32_t keyOffset = 0;
+  if constexpr (isNormalizedKeyMode) {
+    keyOffset = kKeyOffset;
+  }
+  const auto kEmptyGroup = BaseHashTable::TagVector::broadcast(0);
+
+  if (probeState.group() && rowKeysMatch(probeState.group(), row, isNormalizedKeyMode)) {
+    if (nextOffset_) {
+      pushNext(probeState.group(), row);
+    }
+    return true;
+  }
+  while (probeState.hits()) {
+    probeState.loadNextHit<ProbeState::Operation::kInsert>(*this, keyOffset);
+    if (skipGroup && probeState.group() == skipGroup) {
+      continue;
+    }
+    if (rowKeysMatch(probeState.group(), row, isNormalizedKeyMode)) {
+      if (nextOffset_) {
+        pushNext(probeState.group(), row);
+      }
+      return true;
+    }
+  }
+  uint16_t emptyMask =
+      simd::toBitMask(probeState.tagsInTable() == kEmptyGroup) &
+      ProbeState::kFullMask;
+  if (emptyMask > 0) {
+    auto slotIndex = bits::getAndClearLastSetBit(emptyMask);
+    auto tableSlot = probeState.bucketOffset() + slotIndex;
+    if (partitionInfo != nullptr && !partitionInfo->inRange(tableSlot)) {
+      partitionInfo->addOverflow(row);
+      return true;
+    }
+    storeRowPointer(tableSlot, hash, row);
+    return true;
+  }
+  return false;
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
 FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::insertForJoinWithPrefetch(
     char** groups,
     uint64_t* hashes,
     int32_t numGroups,
     TableInsertPartitionInfo* partitionInfo) {
-  auto i = 0;
+  int32_t groupIdx = 0;
   ProbeState states[kPrefetchSize];
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
   int32_t keyOffset = 0;
-  if constexpr (isNormailizedKeyMode) {
+  if constexpr (isNormalizedKeyMode) {
     keyOffset = kKeyOffset;
   }
-  for (; i + kPrefetchSize <= numGroups; i += kPrefetchSize) {
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
-      auto index = i + j;
-      states[j].preProbe(*this, hashes[index], index);
+  std::vector<InsertCollisionEntry> collisionQueue;
+
+  for (; groupIdx + kPrefetchSize <= numGroups; groupIdx += kPrefetchSize) {
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      auto index = groupIdx + batchIdx;
+      states[batchIdx].preProbe(*this, hashes[index], index);
     }
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
-      states[j].firstProbe(*this, keyOffset);
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      states[batchIdx].firstProbe(*this, keyOffset);
     }
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
-      auto index = i + j;
-      buildFullProbe<isNormailizedKeyMode>(
-          states[j], hashes[index], groups[index], j != 0, partitionInfo);
+    for (int32_t batchIdx = 0; batchIdx < kPrefetchSize; ++batchIdx) {
+      auto index = groupIdx + batchIdx;
+      auto& probeState = states[batchIdx];
+      if (batchIdx != 0) {
+        probeState.setTagsInTable(loadTags(probeState.bucketOffset()));
+        probeState.setHits(
+            simd::toBitMask(probeState.tagsInTable() == probeState.wantedTags()));
+      }
+      if (!tryInsertOne<isNormalizedKeyMode>(
+              probeState, groups[index], hashes[index],
+              batchIdx != 0 ? probeState.group() : nullptr, partitionInfo)) {
+        collisionQueue.push_back(
+            {probeState.bucketOffset(), probeState.wantedTags(),
+             groups[index], hashes[index]});
+      }
     }
   }
-  for (; i < numGroups; ++i) {
-    states[0].preProbe(*this, hashes[i], i);
+  for (; groupIdx < numGroups; ++groupIdx) {
+    states[0].preProbe(*this, hashes[groupIdx], groupIdx);
     states[0].firstProbe(*this, keyOffset);
-    buildFullProbe<isNormailizedKeyMode>(
-        states[0], hashes[i], groups[i], false, partitionInfo);
+    if (!tryInsertOne<isNormalizedKeyMode>(
+            states[0], groups[groupIdx], hashes[groupIdx],
+            nullptr, partitionInfo)) {
+      collisionQueue.push_back(
+          {states[0].bucketOffset(), states[0].wantedTags(),
+           groups[groupIdx], hashes[groupIdx]});
+    }
+  }
+
+  processInsertCollisions<isNormalizedKeyMode>(
+      collisionQueue, states, groups, hashes, partitionInfo);
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::processProbeCollisionSequential(
+    ProbeState* states,
+    std::vector<ProbeCollisionEntry>& collisionQueue,
+    int32_t queueIdx,
+    int32_t batchSize,
+    const uint64_t* keys,
+    char** hits) {
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    states[batchIdx].setBucketOffset(nextBucketOffset(entry.bucketOffset_));
+    states[batchIdx].setWantedTags(entry.wantedTags_);
+    states[batchIdx].setRowIndex(entry.row_);
+    states[batchIdx].setGroup(nullptr);
+    states[batchIdx].setTagsInTable(BaseHashTable::loadTags(
+        reinterpret_cast<uint8_t*>(table_), states[batchIdx].bucketOffset()));
+    states[batchIdx].setHits(
+        simd::toBitMask(states[batchIdx].tagsInTable() == entry.wantedTags_) &
+        ProbeState::kFullMask);
+    hits[entry.row_] =
+        states[batchIdx].joinNormalizedKeyFullProbe(*this, keys);
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::processProbeCollisionPrefetch(
+    std::vector<ProbeCollisionEntry>& collisionQueue,
+    int32_t queueIdx,
+    int32_t batchSize,
+    const uint64_t* keys,
+    char** hits,
+    std::vector<ProbeCollisionEntry>& newQueue) {
+  constexpr int32_t kKeyOffset =
+      -static_cast<int32_t>(sizeof(normalized_key_t));
+  const auto kEmptyGroup =
+      BaseHashTable::TagVector::broadcast(ProbeState::kEmptyTag);
+
+  // Advance bucket offsets and prefetch.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    entry.bucketOffset_ = nextBucketOffset(entry.bucketOffset_);
+    __builtin_prefetch(
+        reinterpret_cast<uint8_t*>(table_) + entry.bucketOffset_);
+  }
+
+  BaseHashTable::TagVector tagsTable[kPrefetchSize];
+  BaseHashTable::MaskType hitMasks[kPrefetchSize];
+
+  // Load tags and prefetch matching rows.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    tagsTable[batchIdx] = BaseHashTable::loadTags(
+        reinterpret_cast<uint8_t*>(table_), entry.bucketOffset_);
+    hitMasks[batchIdx] =
+        simd::toBitMask(tagsTable[batchIdx] == entry.wantedTags_) &
+        ProbeState::kFullMask;
+    if (hitMasks[batchIdx]) {
+      uint16_t hitBits = hitMasks[batchIdx];
+      int32_t hit = bits::getAndClearLastSetBit(hitBits);
+      char* group = row(entry.bucketOffset_, hit);
+      __builtin_prefetch(group + kKeyOffset);
+    }
+  }
+
+  // Process each entry: match, empty slot, or enqueue.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    bool hasEmptyTag =
+        simd::toBitMask(tagsTable[batchIdx] == kEmptyGroup);
+    if (!hitMasks[batchIdx] && hasEmptyTag) {
+      hits[entry.row_] = nullptr;
+      continue;
+    }
+    if (!hitMasks[batchIdx]) {
+      newQueue.push_back(entry);
+      continue;
+    }
+    bool found = false;
+    do {
+      int32_t hit = bits::getAndClearLastSetBit(hitMasks[batchIdx]);
+      char* group = row(entry.bucketOffset_, hit);
+      __builtin_prefetch(group + kKeyOffset);
+      if (RowContainer::normalizedKey(group) == keys[entry.row_]) {
+        incrementHits();
+        hits[entry.row_] = group;
+        found = true;
+        break;
+      }
+    } while (hitMasks[batchIdx]);
+    if (!found) {
+      if (hasEmptyTag) {
+        hits[entry.row_] = nullptr;
+      } else {
+        newQueue.push_back(entry);
+      }
+    }
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::processProbeCollisions(
+    std::vector<ProbeCollisionEntry>& collisionQueue,
+    ProbeState* states,
+    const uint64_t* keys,
+    char** hits) {
+  while (!collisionQueue.empty()) {
+    std::vector<ProbeCollisionEntry> newQueue;
+    int32_t numEntries = collisionQueue.size();
+
+    for (int32_t queueIdx = 0; queueIdx < numEntries; queueIdx += kPrefetchSize) {
+      int32_t batchSize =
+          std::min(kPrefetchSize, static_cast<int32_t>(numEntries - queueIdx));
+
+      if (batchSize <= kSequentialThreshold) {
+        processProbeCollisionSequential(
+            states, collisionQueue, queueIdx, batchSize, keys, hits);
+      } else {
+        processProbeCollisionPrefetch(
+            collisionQueue, queueIdx, batchSize, keys, hits, newQueue);
+      }
+    }
+    collisionQueue.swap(newQueue);
+  }
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
+bool HashTable<ignoreNullKeys>::allocateInsertSlot(
+    InsertCollisionEntry& entry,
+    uint16_t emptyMask,
+    TableInsertPartitionInfo* partitionInfo) {
+  auto slotBit = bits::getAndClearLastSetBit(emptyMask);
+  auto slotIndex = entry.bucketOffset_ + slotBit;
+  if (partitionInfo != nullptr && !partitionInfo->inRange(slotIndex)) {
+    partitionInfo->addOverflow(entry.group_);
+    return true;
+  }
+  storeRowPointer(slotIndex, entry.hash_, entry.group_);
+  return true;
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
+void HashTable<ignoreNullKeys>::processInsertCollisionSequential(
+    ProbeState* states,
+    std::vector<InsertCollisionEntry>& collisionQueue,
+    int32_t queueIdx,
+    int32_t batchSize,
+    char** groups,
+    uint64_t* hashes,
+    TableInsertPartitionInfo* partitionInfo) {
+  (void)groups;
+  (void)hashes;
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    entry.bucketOffset_ = nextBucketOffset(entry.bucketOffset_);
+    auto& probeState = states[batchIdx];
+    probeState.setBucketOffset(entry.bucketOffset_);
+    probeState.setWantedTags(entry.wantedTags_);
+    probeState.setTagsInTable(loadTags(entry.bucketOffset_));
+    probeState.setHits(
+        simd::toBitMask(probeState.tagsInTable() == entry.wantedTags_) &
+        ProbeState::kFullMask);
+    probeState.setGroup(nullptr);
+    probeState.setIndexInTags(ProbeState::kNotSet);
+    buildFullProbe<isNormalizedKeyMode>(
+        probeState, entry.hash_, entry.group_, false, partitionInfo);
+  }
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
+void HashTable<ignoreNullKeys>::processInsertCollisionPrefetch(
+    std::vector<InsertCollisionEntry>& collisionQueue,
+    int32_t queueIdx,
+    int32_t batchSize,
+    char** groups,
+    uint64_t* hashes,
+    TableInsertPartitionInfo* partitionInfo,
+    std::vector<InsertCollisionEntry>& newQueue) {
+  (void)groups;
+  (void)hashes;
+  constexpr int32_t kKeyOffset =
+      -static_cast<int32_t>(sizeof(normalized_key_t));
+  int32_t keyOffset = 0;
+  if constexpr (isNormalizedKeyMode) {
+    keyOffset = kKeyOffset;
+  }
+  const auto kEmptyGroup = BaseHashTable::TagVector::broadcast(0);
+
+  // Advance bucket offsets and prefetch.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    entry.bucketOffset_ = nextBucketOffset(entry.bucketOffset_);
+    __builtin_prefetch(
+        reinterpret_cast<uint8_t*>(table_) + entry.bucketOffset_);
+  }
+
+  BaseHashTable::TagVector tagsTable[kPrefetchSize];
+  BaseHashTable::MaskType hitMasks[kPrefetchSize];
+
+  // Load tags and prefetch matching rows.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+    tagsTable[batchIdx] = BaseHashTable::loadTags(
+        reinterpret_cast<uint8_t*>(table_), entry.bucketOffset_);
+    hitMasks[batchIdx] =
+        simd::toBitMask(tagsTable[batchIdx] == entry.wantedTags_) &
+        ProbeState::kFullMask;
+    if (hitMasks[batchIdx]) {
+      uint16_t hitBits = hitMasks[batchIdx];
+      int32_t hit = bits::getAndClearLastSetBit(hitBits);
+      char* group = row(entry.bucketOffset_, hit);
+      __builtin_prefetch(group + keyOffset);
+    }
+  }
+
+  // Process each entry.
+  for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+    auto& entry = collisionQueue[queueIdx + batchIdx];
+
+    // Re-load tags if an earlier entry modified this bucket.
+    bool bucketModified = false;
+    for (int32_t prevIdx = 0; prevIdx < batchIdx; ++prevIdx) {
+      if (collisionQueue[queueIdx + prevIdx].bucketOffset_ ==
+          entry.bucketOffset_) {
+        bucketModified = true;
+        break;
+      }
+    }
+    if (bucketModified) {
+      tagsTable[batchIdx] = loadTags(entry.bucketOffset_);
+      hitMasks[batchIdx] =
+          simd::toBitMask(tagsTable[batchIdx] == entry.wantedTags_) &
+          ProbeState::kFullMask;
+    }
+
+    uint16_t emptyMask =
+        simd::toBitMask(tagsTable[batchIdx] == kEmptyGroup) &
+        ProbeState::kFullMask;
+
+    if (!hitMasks[batchIdx] && emptyMask) {
+      allocateInsertSlot<isNormalizedKeyMode>(
+          entry, emptyMask, partitionInfo);
+      continue;
+    }
+    if (!hitMasks[batchIdx]) {
+      newQueue.push_back(entry);
+      continue;
+    }
+
+    bool found = false;
+    do {
+      int32_t hit = bits::getAndClearLastSetBit(hitMasks[batchIdx]);
+      char* group = row(entry.bucketOffset_, hit);
+      __builtin_prefetch(group + keyOffset);
+      if (rowKeysMatch(group, entry.group_, isNormalizedKeyMode)) {
+        if (nextOffset_) {
+          pushNext(group, entry.group_);
+        }
+        found = true;
+        break;
+      }
+    } while (hitMasks[batchIdx]);
+
+    if (found) {
+      continue;
+    }
+    if (emptyMask) {
+      allocateInsertSlot<isNormalizedKeyMode>(
+          entry, emptyMask, partitionInfo);
+    } else {
+      newQueue.push_back(entry);
+    }
+  }
+}
+
+template <bool ignoreNullKeys>
+template <bool isNormalizedKeyMode>
+void HashTable<ignoreNullKeys>::processInsertCollisions(
+    std::vector<InsertCollisionEntry>& collisionQueue,
+    ProbeState* states,
+    char** groups,
+    uint64_t* hashes,
+    TableInsertPartitionInfo* partitionInfo) {
+  while (!collisionQueue.empty()) {
+    std::vector<InsertCollisionEntry> newQueue;
+    int32_t numEntries = collisionQueue.size();
+
+    for (int32_t queueIdx = 0; queueIdx < numEntries; queueIdx += kPrefetchSize) {
+      int32_t batchSize = std::min(
+          kPrefetchSize, static_cast<int32_t>(numEntries - queueIdx));
+
+      if (batchSize <= kSequentialThreshold) {
+        processInsertCollisionSequential<isNormalizedKeyMode>(
+            states, collisionQueue, queueIdx, batchSize,
+            groups, hashes, partitionInfo);
+      } else {
+        processInsertCollisionPrefetch<isNormalizedKeyMode>(
+            collisionQueue, queueIdx, batchSize,
+            groups, hashes, partitionInfo, newQueue);
+      }
+    }
+    collisionQueue.swap(newQueue);
   }
 }
 
@@ -1525,6 +3075,11 @@ void HashTable<ignoreNullKeys>::insertForJoin(
       BOLT_CHECK_LT(index, capacity_);
       arrayPushRow(groups[i], index);
     }
+    return;
+  }
+
+  if (hashMode_ == HashMode::kTaperHash) {
+    insertForJoinInTaperKey(groups, hashes, numGroups, partitionInfo);
     return;
   }
 
@@ -1577,6 +3132,7 @@ void HashTable<ignoreNullKeys>::rehash(bool initNormalizedKeys) {
       numGroups = rowContainer->listRows(&iterator, kHashBatchSize, groups);
       if (!insertBatch(
               groups, numGroups, hashes, initNormalizedKeys || i != 0)) {
+        // hash mode wont be kTaperKey here, so no need to check.
         BOLT_CHECK_NE(hashMode_, HashMode::kHash);
         setHashMode(HashMode::kHash, 0);
         return;
@@ -1587,7 +3143,19 @@ void HashTable<ignoreNullKeys>::rehash(bool initNormalizedKeys) {
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
-  BOLT_CHECK_NE(hashMode_, HashMode::kHash);
+  if (enableTaper_ && !simdActive() && hybridData_ == nullptr) {
+    if (!isJoinBuild_) {
+      if (mode == HashMode::kHash || mode == HashMode::kNormalizedKey) {
+        mode = isFlatTaper_ ? HashMode::kTaperFlat : HashMode::kTaperHash;
+      }
+    } else {
+      if (mode == HashMode::kHash) {
+        mode = HashMode::kTaperHash;
+      }
+    }
+  }
+
+  BOLT_CHECK(!isPlainHashMode());
   BOLT_TEST_ADJUST("bytedance::bolt::exec::HashTable::setHashMode", &mode);
   if (mode == HashMode::kArray) {
     const auto bytes = capacity_ * tableSlotSize();
@@ -1597,8 +3165,10 @@ void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
     memset(table_, 0, bytes);
     hashMode_ = HashMode::kArray;
     rehash(true);
-  } else if (mode == HashMode::kHash) {
-    hashMode_ = HashMode::kHash;
+  } else if (
+      mode == HashMode::kHash || mode == HashMode::kTaperHash ||
+      mode == HashMode::kTaperFlat) {
+    hashMode_ = mode;
     for (auto& hasher : hashers_) {
       hasher->resetStats();
     }
@@ -1607,7 +3177,7 @@ void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
     // Makes tables of the right size and rehashes.
     checkSize(numNew, true);
   } else if (mode == HashMode::kNormalizedKey) {
-    hashMode_ = HashMode::kNormalizedKey;
+    hashMode_ = mode;
     capacity_ = 0;
     // Makes tables of the right size and rehashes.
     checkSize(numNew, true);
@@ -1616,6 +3186,7 @@ void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
 
 template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::analyze() {
+  BOLT_CHECK_NE(hashMode_, HashMode::kTaperFlat);
   constexpr int32_t kHashBatchSize = 1024;
   // @lint-ignore CLANGTIDY
   char* groups[kHashBatchSize];
@@ -1970,7 +3541,8 @@ std::string HashTable<ignoreNullKeys>::toString(
 
 namespace {
 bool mayUseValueIds(const BaseHashTable& table) {
-  if (table.hashMode() == BaseHashTable::HashMode::kHash) {
+  if (table.hashMode() == BaseHashTable::HashMode::kHash ||
+      table.hashMode() == BaseHashTable::HashMode::kTaperHash) {
     return false;
   }
   for (auto& hasher : table.hashers()) {
@@ -1996,12 +3568,17 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
       table_ = nullptr;
       capacity_ = 0;
       numDistinct_ = rows()->numRows();
+    } else if (!taperTableWrapper_.initialized()) {
+      rows_->pool()->freeContiguous(tableAllocation_);
+      taperTableWrapper_.reset();
+      capacity_ = 0;
+      numDistinct_ = rows()->numRows();
     }
     // Call analyze to insert all unique values in row container to the
     // table hashers' uniqueValues_;
     bool analyzeValue = !analyze();
     if (analyzeValue) {
-      if (hashMode_ != HashMode::kHash) {
+      if (!isPlainHashMode()) {
         setHashMode(HashMode::kHash, 0);
       } else {
         checkSize(0, true);
@@ -2070,7 +3647,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     numDistinct_ += other->rows()->numRows();
   }
   if (!useValueIds) {
-    if (hashMode_ != HashMode::kHash) {
+    if (!isPlainHashMode()) {
       setHashMode(HashMode::kHash, 0);
     } else {
       checkSize(0, true);
@@ -2232,6 +3809,7 @@ int32_t HashTable<ignoreNullKeys>::listRows(
     uint64_t maxBytes,
     char** rows) {
   if (iter->hashTableIndex_ == -1) {
+    BOLT_CHECK_NE(hashMode_, HashMode::kTaperFlat);
     auto numRows = rows_->listRows<probeType>(
         &iter->rowContainerIterator_, maxRows, maxBytes, rows);
     if (numRows) {
@@ -2241,11 +3819,10 @@ int32_t HashTable<ignoreNullKeys>::listRows(
     iter->rowContainerIterator_.reset();
   }
   while (iter->hashTableIndex_ < otherTables_.size()) {
-    auto numRows =
-        otherTables_[iter->hashTableIndex_]
-            ->rows()
-            ->template listRows<probeType>(
-                &iter->rowContainerIterator_, maxRows, maxBytes, rows);
+    auto& table = otherTables_[iter->hashTableIndex_];
+    BOLT_CHECK_NE(table->hashMode(), HashMode::kTaperFlat);
+    auto numRows = table->rows()->template listRows<probeType>(
+        &iter->rowContainerIterator_, maxRows, maxBytes, rows);
     if (numRows) {
       return numRows;
     }
@@ -2294,7 +3871,7 @@ int32_t HashTable<false>::listNullKeyRows(
     BOLT_CHECK_GT(nextOffset_, 0);
     BOLT_CHECK_EQ(hashers_.size(), 1);
     HashLookup lookup(hashers_, enableJit_);
-    if (hashMode_ == HashMode::kHash) {
+    if (hashMode_ == HashMode::kHash || hashMode_ == HashMode::kTaperHash) {
       lookup.hashes.push_back(VectorHasher::kNullHash);
     } else {
       lookup.hashes.push_back(0);
@@ -2327,13 +3904,14 @@ void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
   BOLT_CHECK(
       !simdLayoutActive(),
       "erase() not supported on SIMD bucket layout. Set mayErase=true.");
+  BOLT_CHECK_NE(hashMode_, HashMode::kTaperFlat);
   auto numRows = rows.size();
   raw_vector<uint64_t> hashes;
   hashes.resize(numRows);
 
   for (int32_t i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];
-    if (hashMode_ == HashMode::kHash) {
+    if (hashMode_ == HashMode::kHash || hashMode_ == HashMode::kTaperHash) {
       rows_->hash(i, rows, i > 0, hashes.data());
     } else {
       auto column = rows_->columnAt(i);
@@ -3272,7 +4850,7 @@ void BaseHashTable::prepareForGroupProbe(
   const bool useSimd = simdActive();
   for (auto i = 0; i < hashers.size(); ++i) {
     auto& hasher = hashers[i];
-    if (mode != BaseHashTable::HashMode::kHash) {
+    if (!isGenericHashMode(mode)) {
       bool handled = false;
       if (useSimd) {
         handled = hash_table_simd::tryValueIds(
@@ -3283,7 +4861,7 @@ void BaseHashTable::prepareForGroupProbe(
           rehash = true;
         }
       }
-    } else {
+    } else if (!isTaperFlatMode(mode)) {
       bool handled = false;
       if (useSimd) {
         handled = hash_table_simd::tryHash(
@@ -3296,7 +4874,7 @@ void BaseHashTable::prepareForGroupProbe(
   }
 
   if (rehash || capacity() == 0) {
-    if (mode != BaseHashTable::HashMode::kHash) {
+    if (!isGenericHashMode(mode)) {
       decideHashMode(input->size());
       // Do not forward 'ignoreNullKeys' to avoid redundant evaluation of
       // deselectRowsWithNulls.
@@ -3332,7 +4910,9 @@ void BaseHashTable::prepareForJoinProbe(
   const bool useSimd = simdActive();
   for (auto i = 0; i < hashers.size(); ++i) {
     auto& hasher = hashers[i];
-    if (mode != BaseHashTable::HashMode::kHash) {
+    if (mode != BaseHashTable::HashMode::kHash &&
+        mode != BaseHashTable::HashMode::kTaperHash) {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::LookupValueIdsCalls);
       auto& key = input->childAt(hasher->channel());
       hashers_[i]->lookupValueIds(
           *key, rows, lookup.scratchMemory, lookup.hashes);

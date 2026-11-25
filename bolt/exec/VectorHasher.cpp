@@ -68,22 +68,49 @@ namespace bytedance::bolt::exec {
     }                                                                    \
   }()
 
-template <TypeKind Kind>
+namespace {
+
+template <TypeKind Kind, DVecLayout Layout = DVecLayout::kUnknown>
 inline uint64_t hashOne(DecodedVector& decoded, vector_size_t index) {
   if constexpr (
       Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
       Kind == TypeKind::MAP) {
     // Virtual function call for complex type.
-    return decoded.base()->hashValueAt(decoded.index(index));
+    return decoded.base()->hashValueAt(decoded.index<Layout>(index));
   }
 
   // Inlined for scalars.
   using T = typename KindToFlatVector<Kind>::HashRowType;
   if constexpr (std::is_floating_point_v<T>) {
-    return util::floating_point::NaNAwareHash<T>{}(decoded.valueAt<T>(index));
+    return util::floating_point::NaNAwareHash<T>{}(
+        decoded.valueAt<T, Layout>(index));
   } else {
-    return folly::hasher<T>()(decoded.valueAt<T>(index));
+    return folly::hasher<T>()(decoded.valueAt<T, Layout>(index));
   }
+}
+
+template <TypeKind Kind, DVecLayout Layout>
+void hashRows(
+    const SelectivityVector& rows, uint64_t* hashVec, DecodedVector& decoded) {
+  rows.applyToSelected(
+      [&](vector_size_t row) {
+        hashVec[row] = hashOne<Kind, Layout>(decoded, row);
+      },
+      decoded.nulls(&rows));
+}
+
+template <TypeKind Kind, DVecLayout Layout>
+void hashMixRows(
+    const SelectivityVector& rows,
+    uint64_t* result,
+    DecodedVector& decoded,
+    bool mix) {
+  rows.applyToSelected([&](vector_size_t row) {
+    auto hash = hashOne<Kind, Layout>(decoded, row);
+    result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+  });
+}
+
 }
 
 template <TypeKind Kind>
@@ -108,19 +135,22 @@ FLATTEN void VectorHasher::hashValues(
       rows.applyToSelected(
           [&](vector_size_t row) { hashVec[row] = kNullHash; });
     }
-    rows.applyToSelected(
-        [&](vector_size_t row) { hashVec[row] = hashOne<Kind>(decoded_, row); },
-        decoded_.nulls(&rows));
+    if (decoded_.isIdentityMapping()) {
+      hashRows<Kind, DVecLayout::kIdentityNullable>(rows, hashVec, decoded_);
+    } else {
+      hashRows<Kind, DVecLayout::kIndexedNullable>(rows, hashVec, decoded_);
+    }
     if (mix) {
       rows.applyToSelected([&](vector_size_t row) {
         result[row] = bits::hashMix(result[row], hashVec[row]);
       });
     }
   } else {
-    rows.applyToSelected([&](vector_size_t row) {
-      auto hash = hashOne<Kind>(decoded_, row);
-      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
-    });
+    if (decoded_.isIdentityMapping()) {
+      hashMixRows<Kind, DVecLayout::kIdentity>(rows, result, decoded_, mix);
+    } else {
+      hashMixRows<Kind, DVecLayout::kIndexed>(rows, result, decoded_, mix);
+    }
   }
 }
 

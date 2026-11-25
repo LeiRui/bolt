@@ -34,6 +34,7 @@
 #include "bolt/exec/AggregateInfo.h"
 #include "bolt/exec/AggregationMasks.h"
 #include "bolt/exec/DistinctAggregations.h"
+#include "bolt/exec/GroupAggregation.h"
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/SortedAggregations.h"
 #include "bolt/exec/Spiller.h"
@@ -41,7 +42,7 @@
 #include "bolt/exec/VectorHasher.h"
 namespace bytedance::bolt::exec {
 
-class GroupingSet {
+class GroupingSet : public GroupAggregation {
  public:
   GroupingSet(
       const RowTypePtr& inputType,
@@ -55,9 +56,10 @@ class GroupingSet {
       const std::optional<column_index_t>& groupIdChannel,
       const common::SpillConfig* spillConfig,
       tsan_atomic<bool>* nonReclaimableSection,
-      OperatorCtx* operatorCtx);
+      OperatorCtx* operatorCtx,
+      bool enableTaper = false);
 
-  ~GroupingSet();
+  ~GroupingSet() override;
 
   // Used by MarkDistinct operator to identify rows with unique values.
   static std::unique_ptr<GroupingSet> createForMarkDistinct(
@@ -66,11 +68,11 @@ class GroupingSet {
       OperatorCtx* operatorCtx,
       tsan_atomic<bool>* nonReclaimableSection);
 
-  void addInput(const RowVectorPtr& input, bool mayPushdown);
+  void addInput(const RowVectorPtr& input, bool mayPushdown) override;
 
-  void noMoreInput();
+  void noMoreInput() override;
 
-  void putDistinctNewGroupsIndices(int64_t offset) {
+  void putDistinctNewGroupsIndices(int64_t offset) override {
     if (lookup_ && !hasSpilled()) {
       lookup_->distinctNewGroups.reserve(
           lookup_->distinctNewGroups.size() + lookup_->newGroups.size());
@@ -87,7 +89,7 @@ class GroupingSet {
   /// value. This method returns true if no-more-input message has been received
   /// or if some groups are ready for output because pre-grouped keys values
   /// have changed.
-  bool hasOutput();
+  bool hasOutput() override;
 
   /// Called if partial aggregation has reached memory limit or if hasOutput()
   /// returns true. 'maxOutputRows' and 'maxOutputBytes' specify the max number
@@ -97,16 +99,16 @@ class GroupingSet {
       int32_t maxOutputRows,
       int32_t maxOutputBytes,
       RowContainerIterator& iterator,
-      RowVectorPtr& result);
+      RowVectorPtr& result) override;
 
-  uint64_t allocatedBytes() const;
+  uint64_t allocatedBytes() const override;
 
   /// Resets the hash table inside the grouping set when partial aggregation
   /// is full or reclaims memory from distinct aggregation after it has received
   /// all the inputs.
-  void resetTable();
+  void resetTable() override;
 
-  void resetDistinctNewGroups();
+  void resetDistinctNewGroups() override;
 
   /// Returns true if 'this' should start producing partial
   /// aggregation results. Checks the memory consumption against
@@ -114,15 +116,16 @@ class GroupingSet {
   /// can free up space and rehashes and returns false if significant
   /// space was recovered. In specific, changing from an array hash
   /// based on value ranges to one based on value ids can save a lot.
-  bool isPartialFull(int64_t maxBytes);
+  bool isPartialFull(int64_t maxBytes) override;
 
   /// Returns the count of the hash table, if any.
-  int64_t numDistinct() const {
+  int64_t numDistinct() const override {
     return table_ ? table_->numDistinct() : 0;
   }
 
   /// Returns number of global grouping sets rows if there is default output.
-  std::optional<vector_size_t> numDefaultGlobalGroupingSetRows() const {
+  std::optional<vector_size_t> numDefaultGlobalGroupingSetRows()
+      const override {
     if (hasDefaultGlobalGroupingSetOutput()) {
       return globalGroupingSets_.size();
     }
@@ -132,22 +135,35 @@ class GroupingSet {
   const HashLookup& hashLookup() const;
 
   /// Spills all the rows in container.
-  void spill();
+  void spill() override;
 
   /// Spills all the rows in container starting from the offset specified by
   /// 'rowIterator'.
-  void spill(const RowContainerIterator& rowIterator);
+  void spill(const RowContainerIterator& rowIterator) override;
 
   /// Returns the spiller stats including total bytes and rows spilled so far.
-  std::optional<common::SpillStats> spilledStats() const {
+  std::optional<common::SpillStats> spilledStats() const override {
     if (spiller_ == nullptr) {
       return std::nullopt;
     }
     return spiller_->stats();
   }
 
+  std::optional<int64_t> estimateOutputRowSize() const override;
+
+  void updateRuntimeStats(RuntimeStats& runtimeStats) override;
+
+  size_t distinctNewGroupsNum() override {
+    return lookup_->distinctNewGroups.size();
+  }
+
+  void getNewGroupIndices(BufferPtr indices) override {
+    auto* indicesPtr = indices->asMutable<vector_size_t>();
+    std::copy(lookup_->distinctNewGroups.begin(), lookup_->distinctNewGroups.end(), indicesPtr);
+  }
+
   /// Returns the spill read stats, currently only spillReadTime supported.
-  std::optional<common::SpillReadStats> spillReadStats() const {
+  std::optional<common::SpillReadStats> spillReadStats() const override {
     common::SpillReadStats spillReadStats;
     if (merge_) {
       spillReadStats.spillReadTimeUs = merge_->getSpillReadTime();
@@ -166,7 +182,7 @@ class GroupingSet {
   }
 
   /// Returns true if spilling has triggered on this grouping set.
-  bool hasSpilled() const;
+  bool hasSpilled() const override;
 
   /// Returns the hashtable stats.
   HashTableStats hashTableStats() const {
@@ -181,17 +197,17 @@ class GroupingSet {
   }
 
   /// Return the number of rows kept in memory.
-  int64_t numRows() const {
+  int64_t numRows() const override {
     return table_ ? table_->rows()->numRows() : 0;
   }
 
   // Frees hash tables and other state when giving up partial aggregation as
   // non-productive. Must be called before toIntermediate() is used.
-  void abandonPartialAggregation();
+  void abandonPartialAggregation() override;
 
   /// Translates the raw input in input to accumulators initialized from a
   /// single input row. Passes grouping keys through.
-  void toIntermediate(const RowVectorPtr& input, RowVectorPtr& result);
+  void toIntermediate(const RowVectorPtr& input, RowVectorPtr& result) override;
 
   /// Returns default global grouping sets output if there are no input rows.
   /// The default global grouping set output is a single row per global grouping
@@ -199,58 +215,56 @@ class GroupingSet {
   /// This function can also be used with distinct aggregations.
   bool getDefaultGlobalGroupingSetOutput(
       RowContainerIterator& iterator,
-      RowVectorPtr& result);
+      RowVectorPtr& result) override;
 
-  memory::MemoryPool& testingPool() const {
+  memory::MemoryPool& testingPool() const override {
     return pool_;
   }
 
-  std::optional<int64_t> estimateOutputRowSize() const;
-
   /// Returns the number of rows spilled
-  uint64_t totalSpillRowCount() {
+  uint64_t totalSpillRowCount() override {
     return spillSumRowCount_;
   }
 
   /// Returns the number of used rows in spilled files
-  uint64_t outputSpillRowCount() {
+  uint64_t outputSpillRowCount() override {
     return spillOutputRowCount_;
   }
 
-  common::AggregationStats getRuntimeStats() {
+  common::AggregationStats getRuntimeStats() override {
     return stats_;
   }
 
-  void setPreferPartialSpill(bool preferPartialSpill) {
+  void setPreferPartialSpill(bool preferPartialSpill) override {
     preferPartialSpill_ = preferPartialSpill;
   }
 
-  void setSupportRowBasedOutput(bool supportRowBasedOutput) {
+  void setSupportRowBasedOutput(bool supportRowBasedOutput) override {
     supportRowBasedOutput_ = supportRowBasedOutput;
   }
 
-  void setSupportUniqueRowOptimization(bool uniqueRowOpt) {
+  void setSupportUniqueRowOptimization(bool uniqueRowOpt) override {
     supportUniqueRowOpt_ = uniqueRowOpt;
   }
 
-  void populateOutputValidColumns(SelectivityVector* selectedColumns);
+  void populateOutputValidColumns(SelectivityVector* selectedColumns) override;
 
   void convertCompositeInput(
       const std::vector<AggregateInfo>& extractAggregates,
       const CompositeRowVectorPtr& input,
-      const RowVectorPtr& result);
+      const RowVectorPtr& result) override;
 
   void convertRowsFromContainerRows(
       const CompositeRowVectorPtr& compositeResult,
       folly::Range<char**> groups,
-      const std::vector<std::pair<int32_t, int32_t>>& resultRanges);
+      const std::vector<std::pair<int32_t, int32_t>>& resultRanges) override;
 
   void convertRowsFromSpilledRows(
       const CompositeRowVectorPtr& compositeResult,
       std::vector<char*>& rows,
       int32_t resultOffset,
       const std::vector<int32_t>& rowSizeVec,
-      const int64_t totalUniqueRowSize);
+      const int64_t totalUniqueRowSize) override;
 
  private:
   using RowSizeType = int32_t;
@@ -422,6 +436,12 @@ class GroupingSet {
   // 'toIntermediate'.
   std::vector<Accumulator> accumulators(bool excludeToIntermediate);
 
+  // Return the the index of only aggregate function in 'aggregates_' if size of
+  // 'accumulators()' is exactly one, othersize return 'nullopt'.
+  // This is useful to check if flat HashTable is available.
+  std::optional<int> getIndexOfTheOnlyAggregateFunction(
+      bool excludeToIntermediate);
+
   // Calculates the number of groups to extract from 'rowsWhileReadingSpill_'
   // container with rows starting at 'nonSpilledIndex_' in 'nonSpilledRows_'.
   // 'maxOutputRows' and 'maxOutputBytes' specifies the max number of groups and
@@ -486,6 +506,7 @@ class GroupingSet {
   std::vector<VectorPtr> tempVectors_;
   std::unique_ptr<BaseHashTable> table_;
   std::unique_ptr<HashLookup> lookup_;
+  std::vector<char*> workingGroups_;
   SelectivityVector activeRows_;
 
   // Used to allocate memory for a single row accumulating results of global
@@ -566,6 +587,7 @@ class GroupingSet {
   bool preferPartialSpill_{false};
   bool bypassProbeHT_{false};
   double bypassHTDistinctRatio_{0.8};
+  bool enableTaper_;
 
   // for CompositeRowVector
   bool supportRowBasedOutput_{false};

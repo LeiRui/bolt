@@ -293,7 +293,8 @@ void HashBuild::setupTable() {
   lookup_ = std::make_unique<HashLookup>(
       table_->hashers(), queryConfig.enableJitRowEqVectors());
   lookup_->reset(1);
-  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
+  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash &&
+      table_->hashMode() != BaseHashTable::HashMode::kTaperHash;
 
   if (hybridJoin_) {
     table_->hybridData()->setId(static_cast<uint8_t>(driverId_));
@@ -539,6 +540,8 @@ void HashBuild::addSpilledRowInput(std::vector<char*>& rows, uint32_t size) {
 }
 
 void HashBuild::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildAddInputCalls);
   checkRunning();
 
   if (!ensureInputFits(input, {nullptr, 0})) {
@@ -622,6 +625,7 @@ void HashBuild::addInput(RowVectorPtr input) {
   numInputRows_ += activeRows_.countSelected();
 
   if (dropDuplicates_ && !abandonBuildNoDupHash_) {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildDropDuplicatesCalls);
     const bool abandonEarly = abandonBuildNoDupHashEarly(table_->numDistinct());
     if (abandonEarly) {
       // The hash table is no longer directly constructed in addInput. The data
@@ -634,6 +638,7 @@ void HashBuild::addInput(RowVectorPtr input) {
       // Before this step, all rows containing null keys that need to be
       // excluded have already been excluded. The ignoreNullKeys parameter is
       // no longer effective.
+      // disable taper mode for group probe to avoid conflicts
       table_->prepareForGroupProbe(
           *lookup_,
           input,
@@ -644,6 +649,7 @@ void HashBuild::addInput(RowVectorPtr input) {
         return;
       }
       table_->groupProbe(*lookup_);
+      // Restore taper mode after group probe
       spillRowBasedInput();
       return;
     }
@@ -659,16 +665,19 @@ void HashBuild::addInput(RowVectorPtr input) {
   // false for the first time we stop. We do not retain the value ids
   // since the final ones will only be known after all data is
   // received.
-  for (auto& hasher : hashers) {
-    // TODO: Load only for active rows, except if right/full outer join.
-    if (analyzeKeys_) {
-      hasher->computeValueIds(activeRows_, hashes_);
-      analyzeKeys_ = hasher->mayUseValueIds();
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildComputeValueIdsCalls);
+    for (auto& hasher : hashers) {
+      // TODO: Load only for active rows, except if right/full outer join.
+      if (analyzeKeys_) {
+        hasher->computeValueIds(activeRows_, hashes_);
+        analyzeKeys_ = hasher->mayUseValueIds();
+      }
     }
   }
+
   auto rows = table_->rows();
   auto nextOffset = rows->nextOffset();
-
   if (hybridJoin_) {
     // Get batch/row info before processing
     auto batchId = table_->hybridData()->getNumBatches(); // for scattered mode
@@ -706,8 +715,13 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
   } else {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildStoreCalls);
     activeRows_.applyToSelected([&](auto rowIndex) {
-      char* newRow = rows->newRow();
+      char* newRow;
+      {
+        DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::NewRow);
+        newRow = rows->newRow();
+      }
       if (nextOffset) {
         *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
       }
@@ -1090,11 +1104,16 @@ void HashBuild::noMoreInputInternal() {
 }
 
 bool HashBuild::finishHashBuild() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildFinishCalls);
   checkRunning();
 
   // Release the unused memory reservation before building the merged join
   // table.
   pool()->release();
+
+  // clear taper table after deduplication
+  table_->clearTaperTable();
 
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<Driver>> peers;
@@ -1217,6 +1236,10 @@ bool HashBuild::finishHashBuild() {
     }
   }
   recordSpillStats();
+
+  if (operatorCtx_->task()->numTotalDrivers() > 2) {
+    table_->setTaperEnabled(false);
+  }
 
   // TODO: re-enable parallel join build with spilling triggered after
   // https://github.com/facebookincubator/velox/issues/3567 is fixed.

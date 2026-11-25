@@ -1501,6 +1501,88 @@ std::shared_ptr<const OpaqueType> OPAQUE() {
   return OpaqueType::create<Class>();
 }
 
+#define BOLT_DYNAMIC_NUMERIC_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)      \
+  [&]() {                                                                     \
+    switch (typeKind) {                                                       \
+      case ::bytedance::bolt::TypeKind::BOOLEAN: {                            \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::BOOLEAN>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::INTEGER: {                            \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::INTEGER>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::TINYINT: {                            \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::TINYINT>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::SMALLINT: {                           \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::SMALLINT>(          \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::BIGINT: {                             \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::BIGINT>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::HUGEINT: {                            \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::HUGEINT>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::REAL: {                               \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::REAL>(__VA_ARGS__); \
+      }                                                                       \
+      case ::bytedance::bolt::TypeKind::DOUBLE: {                             \
+        return TEMPLATE_FUNC<::bytedance::bolt::TypeKind::DOUBLE>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      default:                                                                \
+        BOLT_FAIL(                                                            \
+            "not a numeric type! kind: {}", mapTypeKindToName(typeKind));     \
+    }                                                                         \
+  }()
+
+#define BOLT_DYNAMIC_NUMERIC_TYPE_DISPATCH_ALL(                           \
+    TEMPLATE_FUNC, T, typeKind, ...)                                      \
+  [&]() {                                                                 \
+    switch (typeKind) {                                                   \
+      case ::bytedance::bolt::TypeKind::BOOLEAN: {                        \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::BOOLEAN>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::INTEGER: {                        \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::INTEGER>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::TINYINT: {                        \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::TINYINT>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::SMALLINT: {                       \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::SMALLINT>(   \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::BIGINT: {                         \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::BIGINT>(     \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::HUGEINT: {                        \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::HUGEINT>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::REAL: {                           \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::REAL>(       \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::bytedance::bolt::TypeKind::DOUBLE: {                         \
+        return TEMPLATE_FUNC<T, ::bytedance::bolt::TypeKind::DOUBLE>(     \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      default:                                                            \
+        BOLT_FAIL(                                                        \
+            "not a numeric type! kind: {}", mapTypeKindToName(typeKind)); \
+    }                                                                     \
+  }()
+
 #define BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)        \
   [&]() {                                                                      \
     switch (typeKind) {                                                        \

@@ -46,6 +46,7 @@ class ExpressionEvaluator;
 namespace bytedance::bolt::exec {
 
 class AggregateFunctionSignature;
+struct RowBasedAggVarsWrapper;
 
 // Returns true if aggregation receives raw (unprocessed) input, e.g. partial
 // and single aggregation.
@@ -320,6 +321,14 @@ class Aggregate {
   /// @param config Query config.
   /// @return An instance of the aggregate function.
   static std::unique_ptr<Aggregate> create(
+       const std::string& name,
+       core::AggregationNode::Step step,
+       const std::vector<TypePtr>& argTypes,
+       const TypePtr& resultType,
+       const core::QueryConfig& config,
+       RowBasedAggVarsWrapper& varOut);
+
+  static std::unique_ptr<Aggregate> create(
       const std::string& name,
       core::AggregationNode::Step step,
       const std::vector<TypePtr>& argTypes,
@@ -437,6 +446,7 @@ class Aggregate {
   // Byte position of null flag in group row.
   int32_t nullByte_;
   uint8_t nullMask_;
+  uint8_t nullUnMask_;
   // Offset of fixed length accumulator state in group row.
   int32_t offset_;
 
@@ -472,11 +482,25 @@ using AggregateFunctionFactory = std::function<std::unique_ptr<Aggregate>(
     const TypePtr& resultType,
     const core::QueryConfig& config)>;
 
+using AggregateFunctionFactoryV2 = std::function<std::unique_ptr<Aggregate>(
+    core::AggregationNode::Step step,
+    const std::vector<TypePtr>& argTypes,
+    const TypePtr& resultType,
+    const core::QueryConfig& config,
+    RowBasedAggVarsWrapper& varOut)>;
+
 /// Register an aggregate function with the specified name and signatures. If
 /// registerCompanionFunctions is true, also register companion aggregate and
 /// scalar functions with it. When functions with `name` already exist, if
 /// overwrite is true, existing registration will be replaced. Otherwise, return
 /// false without overwriting the registry.
+AggregateRegistrationResult registerAggregateFunction(
+    const std::string& name,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactoryV2& factory,
+    bool registerCompanionFunctions = false,
+    bool overwrite = false);
+
 AggregateRegistrationResult registerAggregateFunction(
     const std::string& name,
     const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
@@ -507,7 +531,7 @@ AggregateFunctionSignatureMap getAggregateFunctionSignatures();
 
 struct AggregateFunctionEntry {
   std::vector<AggregateFunctionSignaturePtr> signatures;
-  AggregateFunctionFactory factory;
+  AggregateFunctionFactoryV2 factory;
 };
 
 using AggregateFunctionMap = folly::Synchronized<

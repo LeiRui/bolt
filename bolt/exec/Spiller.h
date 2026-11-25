@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <type_traits>
 #include "bolt/common/base/SpillConfig.h"
 #include "bolt/common/compression/Compression.h"
 #include "bolt/common/memory/MemoryResource.h"
@@ -146,6 +147,20 @@ class Spiller {
   /// processing. Similarly, the spilled rows still stays in the row container.
   /// The caller needs to erase them from the row container.
   void spill(const RowContainerIterator& startRowIter);
+
+  /// Spill with a custom function to list rows from row container or hash
+  /// table.
+  template <typename GenericRowContainer>
+  void spill(GenericRowContainer* container) {
+    return spill(nullptr, container);
+  }
+
+  template <typename GenericRowContainer>
+  void spill(
+      const RowContainerIterator& startRowIter,
+      GenericRowContainer* container) {
+    return spill(&startRowIter, container);
+  }
 
   /// Invoked to spill all the rows pointed by rows. This is used by
   /// 'kOrderByOutput' spiller type to spill during the order by
@@ -311,7 +326,10 @@ class Spiller {
 
   // Invoked to spill. If 'startRowIter' is not null, then we only spill rows
   // from row container starting at the offset pointed by 'startRowIter'.
-  void spill(const RowContainerIterator* startRowIter);
+  template <typename GenericRowContainer>
+  void spill(
+      const RowContainerIterator* startRowIter,
+      GenericRowContainer* container);
 
   // Extracts the keys, dependents or accumulators for 'rows' into '*result'.
   // Creates '*results' in spillPool() if nullptr. Used from Spiller and
@@ -393,9 +411,10 @@ class Spiller {
   // If 'startRowIter' is not null, we prepare runs starting from the offset
   // pointed by 'startRowIter'.
   // The function returns true if it is the last spill run.
+  template <typename GenericRowContainer>
   bool fillSpillRuns(
-      RowContainerIterator* startRowIter = nullptr,
-      uint64_t maxRowsPerPartition = 0);
+      RowContainerIterator* startRowIter,
+      GenericRowContainer* container);
 
   // Prepares spill run of a single partition for the spillable data from the
   // rows.

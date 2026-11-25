@@ -48,6 +48,14 @@ class SimpleNumericAggregate : public exec::Aggregate {
     extractValues(groups, numGroups, result);
   }
 
+  DecodedVector::Layout registerSingleInput(
+       const std::vector<VectorPtr>& inputVecs,
+       const SelectivityVector& rows) {
+    BOLT_CHECK_EQ(inputVecs.size(), 1);
+    inputDecoded_.decode(*inputVecs.at(0), rows);
+    return DecodedVector::getLayout(inputDecoded_);
+  }
+
  protected:
   // TData is either TAccumulator or TResult, which in most cases are the same,
   // but for sum(real) can differ.
@@ -87,6 +95,39 @@ class SimpleNumericAggregate : public exec::Aggregate {
           clearNull(rawNulls, i);
           rawValues[i] = extractOneValue(group);
         }
+      }
+    }
+  }
+
+  template <typename TData = TResult, typename ExtractOneValue>
+    void doExtractValue(
+      char* group,
+      VectorPtr &result,
+      int32_t rowIndex,
+      ExtractOneValue extractOneValue) {
+    BOLT_CHECK_EQ((result)->encoding(), VectorEncoding::Simple::FLAT);
+    auto vector = (result)->as<FlatVector<TData>>();
+    BOLT_CHECK(
+        vector,
+        "Unexpected type of the result vector: {}",
+        (result)->type()->toString());
+    BOLT_CHECK_EQ(vector->elementSize(), sizeof(TData));
+    uint64_t* rawNulls = getRawNulls(vector);
+    if constexpr (std::is_same_v<TData, bool>) {
+      uint64_t* rawValues = vector->template mutableRawValues<uint64_t>();
+      if (isNull(group)) {
+        vector->setNull(rowIndex, true);
+      } else {
+        clearNull(rawNulls, rowIndex);
+        bits::setBit(rawValues, rowIndex, extractOneValue(group));
+      }
+    } else {
+      TData* rawValues = vector->mutableRawValues();
+      if (isNull(group)) {
+        vector->setNull(rowIndex, true);
+      } else {
+        clearNull(rawNulls, rowIndex);
+        rawValues[rowIndex] = extractOneValue(group);
       }
     }
   }
@@ -162,6 +203,42 @@ class SimpleNumericAggregate : public exec::Aggregate {
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<tableHasNulls, TData>(
             groups[i], TData(decoded.valueAt<TValue>(i)), updateSingleValue);
+      });
+    }
+  }
+
+  template <
+        bool tableHasNulls,
+        typename TData = TResult,
+        typename TValue = TInput,
+        typename UpdateSingleValue>
+    void updateGroup(
+        char* group,
+        const SelectivityVector& rows,
+        const VectorPtr& arg,
+        UpdateSingleValue updateSingleValue,
+        uint32_t rowIndex) {
+    DecodedVector decoded(*arg, rows);
+    if (decoded.isConstantMapping()) {
+      if (!decoded.isNullAt(0)) {
+        auto value = decoded.valueAt<TValue>(0);
+        updateNonNullValue<tableHasNulls, TData>(
+              group, TData(value), updateSingleValue);
+      }
+    } else if (decoded.mayHaveNulls()) {
+      if (decoded.isNullAt(rowIndex)) {
+        return;
+      }
+      updateNonNullValue<tableHasNulls, TData>(
+          group, TData(decoded.valueAt<TValue>(rowIndex)), updateSingleValue);
+    } else if (decoded.isIdentityMapping() && !std::is_same_v<TValue, bool>) {
+      auto data = decoded.data<TValue>();
+      updateNonNullValue<tableHasNulls, TData>(
+            group, TData(data[rowIndex]), updateSingleValue);
+    } else {
+      rows.applyToSelected([&](vector_size_t i) {
+        updateNonNullValue<tableHasNulls, TData>(
+            group, TData(decoded.valueAt<TValue>(i)), updateSingleValue);
       });
     }
   }
@@ -273,6 +350,8 @@ class SimpleNumericAggregate : public exec::Aggregate {
     }
     updateValue(*exec::Aggregate::value<TDataType>(group), value);
   }
+protected:
+  DecodedVector inputDecoded_;
 };
 
 } // namespace bytedance::bolt::functions::aggregate

@@ -73,6 +73,11 @@ class HashBuild final : public Operator {
     /// The finishing state.
     kFinish = 6,
   };
+#ifdef DEBUG_STAT_ENABLED
+  ~HashBuild() override {
+    debugStat_.print();
+  }
+#endif
 
   struct SpilledRows {
     std::vector<char*>* rows;
@@ -463,7 +468,6 @@ class HashBuild final : public Operator {
   bool isDREnabled_{false};
   int32_t maxHashTableBucketCount_{std::numeric_limits<int32_t>::max()};
   std::shared_ptr<RowFormatInfo> rowFormatInfo_{nullptr};
-
   // For hybrid join
   bool hybridJoin_{false};
   bool scatteredMode_{false}; // Use scattered (non-coalesced) mode
@@ -471,6 +475,7 @@ class HashBuild final : public Operator {
   std::unique_ptr<HybridContainer> hybridData_;
 
   bool reuseHashTable_ = false;
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashBuild)
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

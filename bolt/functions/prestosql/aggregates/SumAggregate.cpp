@@ -28,6 +28,7 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/exec/AggregateInfo.h"
 #include "bolt/functions/lib/aggregates/SumAggregateBase.h"
 #include "bolt/functions/prestosql/aggregates/AggregateNames.h"
 using namespace bytedance::bolt::functions::aggregate;
@@ -36,6 +37,25 @@ namespace bytedance::bolt::aggregate::prestosql {
 namespace {
 template <typename TInput, typename TAccumulator, typename ResultType>
 using SumAggregate = SumAggregateBase<TInput, TAccumulator, ResultType>;
+
+template <typename T>
+struct IsSumAggregate : std::false_type {};
+
+template <typename A, typename B, typename C>
+struct IsSumAggregate<SumAggregate<A, B, C>> : std::true_type {};
+
+template <typename T>
+std::enable_if_t<!IsSumAggregate<T>::value, std::unique_ptr<T>>
+setVarOut(exec::RowBasedAggVarsWrapper& varOut, std::unique_ptr<T> t) {
+  return t;
+}
+
+template <typename T>
+std::enable_if_t<IsSumAggregate<T>::value, std::unique_ptr<T>>
+setVarOut(exec::RowBasedAggVarsWrapper& varOut, std::unique_ptr<T> t) {
+  varOut.vars = *t;
+  return t;
+}
 
 template <template <typename U, typename V, typename W> class T>
 exec::AggregateRegistrationResult registerSum(const std::string& name) {
@@ -74,8 +94,9 @@ exec::AggregateRegistrationResult registerSum(const std::string& name) {
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
           const TypePtr& resultType,
-          const core::QueryConfig&
-          /*config*/) -> std::unique_ptr<exec::Aggregate> {
+          const core::QueryConfig& /*config*/,
+          exec::RowBasedAggVarsWrapper& varOut)
+          -> std::unique_ptr<exec::Aggregate> {
         BOLT_CHECK_EQ(argTypes.size(), 1, "{} takes only one argument", name);
         auto inputType = argTypes[0];
         switch (inputType->kind()) {
@@ -107,7 +128,7 @@ exec::AggregateRegistrationResult registerSum(const std::string& name) {
             if (resultType->kind() == TypeKind::REAL) {
               return std::make_unique<T<double, double, float>>(resultType);
             }
-            return std::make_unique<T<double, double, double>>(DOUBLE());
+            return setVarOut(varOut, std::make_unique<T<double, double, double>>(DOUBLE()));
           case TypeKind::VARBINARY:
             // Always use int128_t template for Varbinary as the result
             // type is either int128_t or

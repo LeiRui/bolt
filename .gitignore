@@ -285,6 +285,8 @@ cmake_build
 cmake-build-debug
 cmake-build-release
 /lib/
+/deps/
+/include/
 
 # tests
 test/test.sql

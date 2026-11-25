@@ -111,10 +111,46 @@ TEST_F(SumTest, groupByNan) {
   testAggregations(data, {"c0"}, {}, expectedResult, {}, false);
 }
 
+TEST_F(SumTest, sumVecAgg) {
+  auto rowType = ROW({"c0", "c1"}, {DOUBLE(), INTEGER()});
+  auto vectors = makeVectors(rowType, 4096, 10);
+  createDuckDbTable(vectors);
+
+  // Global aggregation.
+  testAggregations(vectors, {"c1"}, {"sum(c0)"}, "SELECT c1, sum(c0) FROM tmp GROUP BY c1");
+}
+
+TEST_F(SumTest, sumVecAggWithTwoKey) {
+  auto rowType = ROW({"c0", "c1", "c2"}, {DOUBLE(), BIGINT(), BIGINT()});
+  auto vectors = makeVectors(rowType, 4096, 10);
+  createDuckDbTable({vectors});
+
+  // Global aggregation.
+  testAggregations({vectors}, {"c1", "c2"}, {"sum(c0)"}, "SELECT c1, c2, sum(c0) FROM tmp GROUP BY c1, c2");
+}
+
+TEST_F(SumTest, twoSumVecAggWithVarKey) {
+    auto rowType = ROW({"c0", "c1", "c2"}, {DOUBLE(), REAL(), VARCHAR()});
+    auto vectors = makeVectors(rowType, 4096, 10);
+    createDuckDbTable({vectors});
+
+    // Global aggregation.
+    testAggregations({vectors}, {"c2"}, {"sum(c0)", "avg(c1)"}, "SELECT c2, sum(c0), avg(c1) FROM tmp GROUP BY c2");
+}
+
+TEST_F(SumTest, twoSumVecAggWithVarKeyAndFixed) {
+    auto rowType = ROW({"c0", "c1", "c2", "c3"}, {DOUBLE(), REAL(), VARCHAR(), BIGINT()});
+    auto vectors = makeVectors(rowType, 4096, 10);
+    createDuckDbTable({vectors});
+
+    // Global aggregation.
+    testAggregations({vectors}, {"c2", "c3"}, {"sum(c0)", "avg(c1)"}, "SELECT c2, c3, sum(c0), avg(c1) FROM tmp GROUP BY c2, c3");
+}
+
 TEST_F(SumTest, sumDoubleAndFloat) {
   for (int iter = 0; iter < 3; ++iter) {
     SCOPED_TRACE(fmt::format("test iterations: {}", iter));
-    auto rowType = ROW({"c0", "c1", "c2"}, {REAL(), DOUBLE(), INTEGER()});
+    auto rowType = ROW({"c0", "c1", "c2", "c3"}, {DOUBLE(), DOUBLE(), DOUBLE(), INTEGER()});
     auto vectors = makeVectors(rowType, 1000, 10);
 
     createDuckDbTable(vectors);
@@ -122,9 +158,9 @@ TEST_F(SumTest, sumDoubleAndFloat) {
     // With group by.
     testAggregations(
         vectors,
-        {"c2"},
-        {"sum(c0)", "sum(c1)"},
-        "SELECT c2, sum(c0), sum(c1) FROM tmp GROUP BY c2");
+        { "c3"},
+        {"sum(c0)", "sum(c1)", "sum(c2)"},
+        "SELECT c3, sum(c0), sum(c1), sum(c2) FROM tmp GROUP BY c3");
 
     // Without group by.
     testAggregations(

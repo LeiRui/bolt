@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import platform
 import re
+import shutil
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools import files, scm
@@ -61,6 +63,65 @@ class TorchOption:
         return [None, "CPU", "GPU"]
 
 
+class DepLoader:
+    """Load the Bolt target dependency graph emitted by CMake."""
+
+    def is_bolt(self, name):
+        executable = {
+            "bolt_in_10_min_demo",
+            "bolt_sparksql_coverage",
+            "bolt_prestosql_coverage",
+            "bolt_memcpy_meter",
+            "bolt_query_replayer",
+            "bolt_trace_file_tool",
+        }
+        if (
+            name in executable
+            or "example" in name
+            or name.endswith(("test", "benchmark", "fuzzer"))
+            or any(token in name for token in (
+                "_benchmarks_", "_benchmarks", "benchmarks",
+                "_benchmark_", "_benchmark", "benchmark", "_bm",
+            ))
+        ):
+            return False
+        return name in {"duckdb", "tpch_extension", "dbgen", "md5"} or name.startswith("bolt")
+
+    def get_edge(self, graph, edge):
+        dst, src = edge.get_destination(), edge.get_source()
+        dst_name = graph.get_node(dst)[0].get_attributes()["label"]
+        src_name = graph.get_node(src)[0].get_attributes()["label"]
+        return src_name.replace('"', ""), dst_name.replace('"', "")
+
+    def get_dep(self, path):
+        import pydot
+
+        graph = pydot.graph_from_dot_file(path)[0]
+        result = {}
+        blacklist = {
+            "bolt_link_libs", "bolt_fuzzer_connector",
+            "bolt_hive_config", "bolt_functions_string",
+        }
+        for edge in graph.get_edge_list():
+            src_name, dst_name = self.get_edge(graph, edge)
+            if not self.is_bolt(src_name) or src_name in blacklist or dst_name in blacklist:
+                continue
+            if src_name not in result:
+                result[src_name] = [[], []]
+            if self.is_bolt(dst_name):
+                result[src_name][0].append(dst_name)
+                result.setdefault(dst_name, [[], []])
+            else:
+                result[src_name][1].append(dst_name)
+        return result
+
+    def get_bolt_dep(self, path):
+        return {key: value[0] for key, value in self.get_dep(path).items()}
+
+    def get_third_party_dep(self, path):
+        return {key: value[1] for key, value in self.get_dep(path).items()}
+
+
 class BoltConan(ConanFile):
     description = """
         Bolt is a C++ acceleration library providing composable, extensible and performant data processing toolkit.
@@ -104,6 +165,8 @@ class BoltConan(ConanFile):
         "enable_torch": TorchOption.all(),
         "enable_cudf": [True, False],
         "enable_perf": [True, False],
+        "targets": ["ANY", None],
+        "use_lld": [True, False],
     }
     default_options = {
         "shared": False,
@@ -135,6 +198,8 @@ class BoltConan(ConanFile):
         "enable_torch": TorchOption().value,
         "enable_cudf": False,
         "enable_perf": False,
+        "targets": None,
+        "use_lld": False,
     }
 
     FB_VERSION = "2022.10.31.00"
@@ -356,7 +421,11 @@ class BoltConan(ConanFile):
         cmake_layout(self, build_folder="_build")
 
     def config_options(self):
-        pass
+        if self.options.get_safe("ldb_build"):
+            self.options.enable_exception_trace = False
+        if str(self.settings.build_type) == "Debug":
+            if shutil.which("ld.lld"):
+                self.options.use_lld = True
 
     # Set default options of third parties here
     def configure(self):
@@ -530,6 +599,9 @@ class BoltConan(ConanFile):
         ):
             tc.extra_cxxflags.append("-fno-omit-frame-pointer")
             tc.extra_cflags.append("-fno-omit-frame-pointer")
+        if self.options.use_lld and not bolt_linker:
+            tc.extra_cxxflags.append("-fuse-ld=lld")
+            tc.extra_cflags.append("-fuse-ld=lld")
 
         tc.cache_variables["TREAT_WARNINGS_AS_ERRORS"] = "OFF"
         tc.cache_variables["ENABLE_ALL_WARNINGS"] = "ON"
@@ -698,7 +770,49 @@ class BoltConan(ConanFile):
                 f"✓ compile_commands.json at {self.build_folder}/compile_commands.json"
             )
         else:
-            cmake.build()
+            targets = None
+            target_option = self.options.get_safe("targets")
+            if target_option is not None and target_option.value is not None:
+                targets = [
+                    target.strip()
+                    for target in str(target_option.value).split(",")
+                    if target.strip()
+                ]
+            if targets:
+                self.output.info(f"Building targets: {targets}")
+                for target in targets:
+                    cmake.build(target=target)
+            else:
+                cmake.build()
+            self.generate_dep_graph()
+
+            # HACK: if in editable mode, install into project root dir
+            if not self.package_folder:
+                cmake_program = self.conf.get("tools.cmake:cmake_program", default="cmake")
+                self.run(
+                    f'"{cmake_program}" --install "{self.build_folder}" '
+                    f'--prefix "{self.source_folder}"'
+                )
+
+    def generate_dep_graph(self):
+        dot_file = os.path.join(self.build_folder, "graph", "bolt.dot")
+        os.makedirs(os.path.dirname(dot_file), exist_ok=True)
+        cmake_program = self.conf.get("tools.cmake:cmake_program", default="cmake")
+        graphviz_command = f'"{cmake_program}" --graphviz="{dot_file}" .'
+        self.run(graphviz_command, cwd=self.build_folder)
+        # generate dependency graph
+        dep_path = os.path.join(self.build_folder, "deps")
+        deps = {
+            "deps": DepLoader().get_bolt_dep(dot_file),
+            "thirdparties": DepLoader().get_third_party_dep(dot_file),
+        }
+        os.makedirs(dep_path, exist_ok=True)
+        with open(os.path.join(dep_path, "dep.json"), "w") as f:
+            json.dump(deps, f, indent=4)
+
+    def split_name_version(self, pkg_str):
+        parts = pkg_str.split("/", 1)
+        return parts
 
     def package(self):
         files.copy(
@@ -719,6 +833,13 @@ class BoltConan(ConanFile):
             src=self.source_folder,
             dst=os.path.join(self.package_folder, "licenses"),
         )
+        if self.package_folder:
+            files.copy(
+                self,
+                "deps/dep.json",
+                src=self.build_folder,
+                dst=self.package_folder,
+            )
 
         cmake = CMake(self)
         cmake.configure()
@@ -913,6 +1034,20 @@ class BoltConan(ConanFile):
         if str(self.settings.arch) == "armv9":
             self.output.info("Using fallback -march=armv9-a")
             return f"{base_flags} -march=armv9-a"
-        else:
-            self.output.info("Using fallback -march=armv8.3-a")
-            return f"{base_flags} -march=armv8.3-a"
+        march = "armv8.3-a"
+        if self.settings.os == "Linux" and platform.machine() == "aarch64":
+            try:
+                with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+                    features = next(
+                        (line.split(":", 1)[-1].split() for line in cpuinfo
+                         if line.startswith("Features")),
+                        [],
+                    )
+                if "sve2" in features:
+                    march += "+sve2"
+                elif "sve" in features:
+                    march += "+sve"
+            except OSError as error:
+                self.output.warning(f"Could not read ARM CPU features: {error}")
+        self.output.info(f"Using fallback -march={march}")
+        return f"{base_flags} -march={march}"

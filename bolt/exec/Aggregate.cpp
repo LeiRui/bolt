@@ -34,6 +34,7 @@
 #include "bolt/exec/AggregateCompanionAdapter.h"
 #include "bolt/exec/AggregateCompanionSignatures.h"
 #include "bolt/exec/AggregateWindow.h"
+#include "bolt/exec/AggregateInfo.h"
 #include "bolt/expression/SignatureBinder.h"
 namespace bytedance::bolt::exec {
 
@@ -69,7 +70,7 @@ getAggregateFunctionEntry(const std::string& name) {
 AggregateRegistrationResult registerAggregateFunction(
     const std::string& name,
     const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
-    const AggregateFunctionFactory& factory,
+    const AggregateFunctionFactoryV2& factory,
     bool registerCompanionFunctions,
     bool overwrite) {
   auto sanitizedName = sanitizeName(name);
@@ -109,6 +110,22 @@ AggregateRegistrationResult registerAggregateFunction(
             name, signatures, overwrite);
   }
   return registered;
+}
+
+AggregateRegistrationResult registerAggregateFunction(
+    const std::string& name,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    bool registerCompanionFunctions,
+    bool overwrite) {
+  return registerAggregateFunction(name, signatures, [factory] (
+      core::AggregationNode::Step step,
+      const std::vector<TypePtr>& argTypes,
+      const TypePtr& resultType,
+      const core::QueryConfig& config,
+      RowBasedAggVarsWrapper& varOut) -> std::unique_ptr<Aggregate> {
+    return factory(step, argTypes, resultType, config);
+  }, registerCompanionFunctions, overwrite);
 }
 
 std::vector<AggregateRegistrationResult> registerAggregateFunction(
@@ -265,13 +282,24 @@ std::unique_ptr<Aggregate> Aggregate::create(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& argTypes,
     const TypePtr& resultType,
-    const core::QueryConfig& config) {
+    const core::QueryConfig& config,
+    RowBasedAggVarsWrapper& varOut) {
   // Lookup the function in the new registry first.
   if (auto func = getAggregateFunctionEntry(name)) {
-    return func->factory(step, argTypes, resultType, config);
+    return func->factory(step, argTypes, resultType, config, varOut);
   }
 
   BOLT_FAIL("Aggregate function not registered: {}", name);
+}
+
+std::unique_ptr<Aggregate> Aggregate::create(
+    const std::string& name,
+    core::AggregationNode::Step step,
+    const std::vector<TypePtr>& argTypes,
+    const TypePtr& resultType,
+    const core::QueryConfig& config) {
+  RowBasedAggVarsWrapper wrapper;
+  return create(name, step, argTypes, resultType, config, wrapper);
 }
 
 // static
@@ -319,6 +347,7 @@ void Aggregate::setOffsetsInternal(
     int32_t rowSizeOffset) {
   nullByte_ = nullByte;
   nullMask_ = nullMask;
+  nullUnMask_ = ~nullMask_;
   offset_ = offset;
   rowSizeOffset_ = rowSizeOffset;
 }

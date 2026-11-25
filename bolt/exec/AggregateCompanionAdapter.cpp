@@ -32,6 +32,7 @@
 
 #include "bolt/exec/AggregateCompanionSignatures.h"
 #include "bolt/exec/AggregateFunctionRegistry.h"
+#include "bolt/exec/AggregateInfo.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/expression/SignatureBinder.h"
 #include "bolt/functions/lib/aggregates/AggregateToIntermediate.h"
@@ -303,7 +304,8 @@ bool CompanionFunctionsRegistrar::registerPartialFunction(
                  core::AggregationNode::Step step,
                  const std::vector<TypePtr>& argTypes,
                  const TypePtr& resultType,
-                 const core::QueryConfig& config)
+                 const core::QueryConfig& config,
+                 RowBasedAggVarsWrapper& varOut)
                  -> std::unique_ptr<Aggregate> {
                if (auto func = getAggregateFunctionEntry(name)) {
                  core::AggregationNode::Step usedStep{
@@ -312,7 +314,7 @@ bool CompanionFunctionsRegistrar::registerPartialFunction(
                    usedStep = core::AggregationNode::Step::kIntermediate;
                  }
                  auto fn =
-                     func->factory(usedStep, argTypes, resultType, config);
+                     func->factory(usedStep, argTypes, resultType, config, varOut);
                  BOLT_CHECK_NOT_NULL(fn);
                  return std::make_unique<
                      AggregateCompanionAdapter::PartialFunction>(
@@ -348,11 +350,13 @@ bool CompanionFunctionsRegistrar::registerMergeFunction(
                  const core::QueryConfig& config)
                  -> std::unique_ptr<Aggregate> {
                if (auto func = getAggregateFunctionEntry(name)) {
+                 RowBasedAggVarsWrapper wrapper;
                  auto fn = func->factory(
                      core::AggregationNode::Step::kIntermediate,
                      argTypes,
                      resultType,
-                     config);
+                     config,
+                     wrapper);
                  BOLT_CHECK_NOT_NULL(fn);
                  return std::make_unique<
                      AggregateCompanionAdapter::MergeFunction>(
@@ -404,11 +408,13 @@ bool CompanionFunctionsRegistrar::registerMergeExtractFunctionWithSuffix(
               }
 
               if (auto func = getAggregateFunctionEntry(name)) {
+                RowBasedAggVarsWrapper wrapper;
                 auto fn = func->factory(
                     core::AggregationNode::Step::kFinal,
                     argTypes,
                     originalResultType,
-                    config);
+                    config,
+                    wrapper);
                 BOLT_CHECK_NOT_NULL(fn);
                 return std::make_unique<
                     AggregateCompanionAdapter::MergeExtractFunction>(
@@ -453,13 +459,15 @@ bool CompanionFunctionsRegistrar::registerMergeExtractFunction(
               core::AggregationNode::Step /*step*/,
               const std::vector<TypePtr>& argTypes,
               const TypePtr& resultType,
-              const core::QueryConfig& config) -> std::unique_ptr<Aggregate> {
+              const core::QueryConfig& config,
+              RowBasedAggVarsWrapper& varOut) -> std::unique_ptr<Aggregate> {
             if (auto func = getAggregateFunctionEntry(name)) {
               auto fn = func->factory(
                   core::AggregationNode::Step::kFinal,
                   argTypes,
                   resultType,
-                  config);
+                  config,
+                  varOut);
               BOLT_CHECK_NOT_NULL(fn);
               return std::make_unique<
                   AggregateCompanionAdapter::MergeExtractFunction>(
@@ -511,8 +519,9 @@ bool CompanionFunctionsRegistrar::registerExtractFunctionWithSuffix(
       }
 
       if (auto func = getAggregateFunctionEntry(originalName)) {
+        RowBasedAggVarsWrapper w;
         auto fn = func->factory(
-            core::AggregationNode::Step::kFinal, argTypes, resultType, config);
+            core::AggregationNode::Step::kFinal, argTypes, resultType, config, w);
         BOLT_CHECK_NOT_NULL(fn);
         return std::make_shared<AggregateCompanionAdapter::ExtractFunction>(
             std::move(fn));
@@ -568,8 +577,9 @@ bool CompanionFunctionsRegistrar::registerExtractFunction(
     }
 
     if (auto func = getAggregateFunctionEntry(originalName)) {
+      RowBasedAggVarsWrapper w;
       auto fn = func->factory(
-          core::AggregationNode::Step::kFinal, argTypes, resultType, config);
+          core::AggregationNode::Step::kFinal, argTypes, resultType, config, w);
       BOLT_CHECK_NOT_NULL(fn);
       return std::make_shared<AggregateCompanionAdapter::ExtractFunction>(
           std::move(fn));
