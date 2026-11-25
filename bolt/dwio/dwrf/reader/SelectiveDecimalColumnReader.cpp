@@ -46,9 +46,10 @@ SelectiveDecimalColumnReader<DataT>::SelectiveDecimalColumnReader(
   }
   version_ = convertRleVersion(stripe.getEncoding(encodingKey).kind());
   auto data = encodingKey.forKind(proto::Stream_Kind_DATA);
+  valueUsesVarints_ = stripe.getUseVInts(data);
   valueDecoder_ = createDirectDecoder</*isSigned*/ true>(
       stripe.getStream(data, params.streamLabels().label(), true),
-      stripe.getUseVInts(data),
+      valueUsesVarints_,
       sizeof(DataT));
 
   // [NOTICE] DWRF's NANO_DATA has the same enum value as ORC's SECONDARY
@@ -225,7 +226,15 @@ void SelectiveDecimalColumnReader<DataT>::readHelper(const RowSet& rows) {
   bytedance::bolt::dwio::common::
       ColumnVisitor<DataT, common::AlwaysTrue, decltype(extractValues), kDense>
           valueVisitor(alwaysTrue, this, rows, extractValues);
-  decodeWithVisitor<DirectDecoder<true>>(valueDecoder_.get(), valueVisitor);
+#if defined(__aarch64__)
+  if constexpr (std::is_same_v<DataT, std::int64_t>) {
+    decodeWithVisitor<DirectDecoder<true>>(
+        valueDecoder_.get(), valueVisitor, !valueUsesVarints_);
+  } else
+#endif
+  {
+    decodeWithVisitor<DirectDecoder<true>>(valueDecoder_.get(), valueVisitor);
+  }
   readOffset_ += numRows;
 
   fillDecimals();

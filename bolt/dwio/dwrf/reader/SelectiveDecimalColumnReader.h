@@ -76,6 +76,7 @@ class SelectiveDecimalColumnReader : public SelectiveColumnReader {
   BufferPtr scaleBuffer_;
   RleVersion version_;
   int32_t scale_ = 0;
+  bool valueUsesVarints_;
 };
 
 } // namespace bytedance::bolt::dwrf

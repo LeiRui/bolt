@@ -567,10 +567,11 @@ class SelectiveColumnReader {
     return false;
   }
 
-  template <typename Decoder, typename ColumnVisitor>
+  template <typename Decoder, typename ColumnVisitor, typename... Options>
   void decodeWithVisitor(
       IntDecoder<Decoder::kIsSigned>* intDecoder,
-      ColumnVisitor& visitor) {
+      ColumnVisitor& visitor,
+      Options... options) {
     auto decoder = dynamic_cast<Decoder*>(intDecoder);
     BOLT_CHECK(
         decoder,
@@ -579,9 +580,9 @@ class SelectiveColumnReader {
     const uint64_t* nulls =
         nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
     if (nulls) {
-      decoder->template readWithVisitor<true>(nulls, visitor);
+      decoder->template readWithVisitor<true>(nulls, visitor, options...);
     } else {
-      decoder->template readWithVisitor<false>(nulls, visitor);
+      decoder->template readWithVisitor<false>(nulls, visitor, options...);
     }
   }
 
