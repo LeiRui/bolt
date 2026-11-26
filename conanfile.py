@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import platform
 import re
+import shlex
+from pathlib import Path
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools import files, scm
@@ -498,6 +501,7 @@ class BoltConan(ConanFile):
             tc.extra_cflags.append(flags)
 
         if str(self.settings.arch) in ["armv8", "arm", "armv9"]:
+            tc.cache_variables["CMAKE_EXPORT_COMPILE_COMMANDS"] = True
             flags = self._get_arm_cpu_flags()
             tc.extra_cxxflags.append(flags)
             tc.extra_cflags.append(flags)
@@ -700,6 +704,39 @@ class BoltConan(ConanFile):
         else:
             cmake.build()
 
+    def _package_arm_isa(self):
+        """Export the target options from the actual Bolt C++ compile commands."""
+        database = Path(self.build_folder) / "compile_commands.json"
+        source = (Path(self.source_folder) / "bolt").resolve()
+        common = None
+        for unit in json.loads(database.read_text(encoding="utf-8")):
+            path = (Path(unit["directory"]) / unit["file"]).resolve()
+            if source not in path.parents or path.suffix not in {".cc", ".cpp", ".cxx"}:
+                continue
+            argv = iter(unit.get("arguments") or shlex.split(unit["command"]))
+            flags = []
+            for arg in argv:
+                if arg in ("-D", "-U"):
+                    arg += next(argv)
+                if arg.startswith(("-march=", "-mcpu=", "-msve-vector-bits=")) or (
+                    arg.split("=", 1)[0] in ("-DSVE_BITS", "-USVE_BITS")
+                ):
+                    if arg.partition("=")[2].split("+", 1)[0] == "native":
+                        raise ConanInvalidConfiguration("Cannot export a host-relative ARM target")
+                    flags.append(arg)
+            if not any(f.startswith(("-march=", "-mcpu=")) for f in flags):
+                raise ConanInvalidConfiguration(f"Missing ARM target in {path}")
+            if common is not None and flags != common:
+                raise ConanInvalidConfiguration(f"Inconsistent ARM target options in {path}")
+            common = flags
+        if common is None:
+            raise ConanInvalidConfiguration("No Bolt C++ compile commands found")
+        files.save(
+            self,
+            os.path.join(self.package_folder, "res", "bolt", "arm-isa-v1.json"),
+            json.dumps(common) + "\n",
+        )
+
     def package(self):
         files.copy(
             self,
@@ -723,6 +760,8 @@ class BoltConan(ConanFile):
         cmake = CMake(self)
         cmake.configure()
         cmake.install()
+        if str(self.settings.arch) in ("armv8", "armv9"):
+            self._package_arm_isa()
 
     def package_info(self):
         self.cpp_info.set_property("cmake_target_name", "bolt::bolt")
