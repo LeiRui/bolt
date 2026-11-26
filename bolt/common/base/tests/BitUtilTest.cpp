@@ -195,6 +195,15 @@ TEST_F(BitUtilTest, isAllSet) {
   EXPECT_EQ(findLastBit(word, 381, 600), 383);
 }
 
+TEST_F(BitUtilTest, findFirstBitInPartialFinalWord) {
+  std::vector<uint64_t> words(33, 0);
+  words[1] = 1;
+  EXPECT_EQ(findFirstBit(words.data(), 0, 65), 64);
+  words[1] = 0;
+  words[4] = 1;
+  EXPECT_EQ(findFirstBit(words.data(), 0, 65), -1);
+}
+
 TEST_F(BitUtilTest, findFirstBit) {
   constexpr int32_t kNumBits = 17 * 64;
   std::vector<uint64_t> words(nwords(kNumBits), 0);
