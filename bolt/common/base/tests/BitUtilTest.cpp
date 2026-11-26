@@ -227,6 +227,15 @@ TEST_F(BitUtilTest, findFirstBit) {
   EXPECT_EQ(findFirstBit(words.data(), 3, kNumBits - 5), -1);
 }
 
+TEST_F(BitUtilTest, isAllSetPartialWordAfterFullWord) {
+  for (bool value : {false, true}) {
+    std::vector<uint64_t> words(33, value ? ~uint64_t{0} : 0);
+    words[1] ^= 1;
+    EXPECT_FALSE(isAllSet(words.data(), 0, 65, value));
+    EXPECT_TRUE(isAllSet(words.data(), 0, 64, value));
+  }
+}
+
 TEST_F(BitUtilTest, simdBitRangeQueries) {
   constexpr int32_t kNumBits = 19 * 64;
   std::vector<uint64_t> words(nwords(kNumBits));
