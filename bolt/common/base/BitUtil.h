@@ -533,9 +533,9 @@ inline int32_t findFirstBit(const uint64_t* bits, int32_t begin, int32_t end) {
   }
 
   if ((end & 63) != 0) {
-    const auto word = bits[wordIndex] & lowMask(end & 63);
+    const auto word = bits[fullWordEnd] & lowMask(end & 63);
     if (word != 0) {
-      return (wordIndex << 6) + __builtin_ctzll(word);
+      return (fullWordEnd << 6) + __builtin_ctzll(word);
     }
   }
   return -1;

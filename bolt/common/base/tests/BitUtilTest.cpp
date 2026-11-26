@@ -227,6 +227,15 @@ TEST_F(BitUtilTest, findFirstBit) {
   EXPECT_EQ(findFirstBit(words.data(), 3, kNumBits - 5), -1);
 }
 
+TEST_F(BitUtilTest, findFirstBitInPartialFinalWord) {
+  std::vector<uint64_t> words(33, 0);
+  words[1] = 1;
+  EXPECT_EQ(findFirstBit(words.data(), 0, 65), 64);
+  words[1] = 0;
+  words[4] = 1;
+  EXPECT_EQ(findFirstBit(words.data(), 0, 65), -1);
+}
+
 TEST_F(BitUtilTest, simdBitRangeQueries) {
   constexpr int32_t kNumBits = 19 * 64;
   std::vector<uint64_t> words(nwords(kNumBits));
