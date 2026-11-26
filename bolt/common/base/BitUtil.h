@@ -452,7 +452,7 @@ isAllSet(const uint64_t* bits, int32_t begin, int32_t end, bool value = true) {
   }
   if ((end & 63) != 0) {
     const auto mask = lowMask(end & 63);
-    return (bits[wordIndex] & mask) == (expected & mask);
+    return (bits[fullWordEnd] & mask) == (expected & mask);
   }
   return true;
 }
