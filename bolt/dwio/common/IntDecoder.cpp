@@ -2433,6 +2433,9 @@ template void IntDecoder<false>::bulkReadRows(
 // and similar functions were made and how to regenerate modified
 // versions of these. This is not intended to be compiled in regular
 // builds and exists as documentation only.
+// The generated cases use generic extraction. When regenerating the
+// selected-row cases, preserve the AArch64 extractVarintPayload calls for
+// two- and three-byte payloads.
 
 std::string codegenVarintMask(int end_byte, int len) {
   CHECK_GE(end_byte + 1, len);
