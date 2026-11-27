@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -1206,6 +1207,28 @@ inline uint64_t extractBits(uint64_t a, uint64_t mask) {
 #else
 template <typename T>
 T extractBits(T a, T mask) {
+#if defined(__aarch64__)
+  if constexpr (
+      std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) {
+    // Move selected bits into the holes below them, preserving their order.
+    // Constant masks let the compiler fold the movement masks ahead of time.
+    constexpr unsigned kBitsCount = 8 * sizeof(T);
+    T holes = T(T(~mask) << 1);
+    a &= mask;
+    for (unsigned shift = 1; shift < kBitsCount; shift <<= 1) {
+      T prefix = T(holes ^ T(holes << 1));
+      for (unsigned distance = 2; distance < kBitsCount; distance <<= 1) {
+        prefix = T(prefix ^ T(prefix << distance));
+      }
+      const T moving = T(prefix & mask);
+      mask = T((mask ^ moving) | (moving >> shift));
+      const T selected = T(a & moving);
+      a = T((a ^ selected) | (selected >> shift));
+      holes = T(holes & ~prefix);
+    }
+    return a;
+  }
+#endif
   constexpr int kBitsCount = 8 * sizeof(T);
   T dst = 0;
   for (int i = 0, k = 0; i < kBitsCount; ++i) {
